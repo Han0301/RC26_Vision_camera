@@ -199,8 +199,10 @@ public:
             return sorted_data[idx] + frac * (sorted_data[idx + 1] - sorted_data[idx]);
         };
 
-        double percentile_90 = get_percentile(0.9);  // 90%上分位
-        double percentile_10 = get_percentile(0.1);  // 90%下分位
+        double percentile_90 = get_percentile(0.9);  // 90%上分位 P90
+        double percentile_10 = get_percentile(0.1);  // 10%下分位 P10
+        double percentile_95 = get_percentile(0.95); // 95%上分位 P95
+        double percentile_5  = get_percentile(0.05); // 5%下分位  P5
 
         // 8. 存入字典返回
         result["max"] = max_val;
@@ -209,6 +211,8 @@ public:
         result["standard_bias"] = standard_bias;
         result["90%bias_max"] = percentile_90;
         result["90%bias_min"] = percentile_10;
+        result["delta"] = max_val - min_val;              // 跳变幅度 Δ
+        result["90%_range"] = percentile_95 - percentile_5; // 90%范围 P95-P5
 
         return result;
     }

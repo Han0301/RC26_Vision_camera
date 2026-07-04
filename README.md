@@ -86,10 +86,13 @@ rosrun camera test_thread_node
 - **移除** `config/` 配置文件目录
 - 引入多线程并行处理架构
 
-### camera_ws2.4 — 方块位姿识别版
-- 识别 kfs（35cm 方块）位姿
-- 优化多线程处理管线
-- 保持 `test_node` + `test_thread_node` 双节点
+### camera_ws2.4 — KFS 方块位姿识别版
+- **新增** `set_filter.h`: 点云滤波模块，过滤无效点
+- **新增** `set_result.cpp`: 识别结果处理与输出
+- **新增** YOLO 设计文档 (`yolo_polymorphic_design.md`)
+- **新增** `learn/` 移至 camera/src 目录
+- **优化** `kfs_locator` 各模块: 识别 35cm 方块 (kfs) 完整位姿
+- **优化** 多线程处理管线 (test_thread.cpp / threadpool.h)
 
 ### camera_ws2.51 — Apriltag 识别版
 - 引入 apriltag 库（`find_package(apriltag REQUIRED)`）

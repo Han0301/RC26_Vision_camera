@@ -5,20 +5,21 @@
 #include <pcl/point_types.h>
 #include "../yolo/yolo_v5.h"
 
-namespace Ten
-{
-namespace kfs_locator
+namespace Ten::kfs_locator
 {
 const int CloudDepth_min = 200;
-const int CloudDepth_max = 2000;
-
+const int CloudDepth_max = 3000;
+const std::string model_path = "/home/h/下载/卷轴检测/best";
+const std::string xpu = "cpu"; // "gpu" or "cpu"
+const int is_blue = 1;      // // 0 表示红场， 1 表示蓝场
 
 class Ten_set_detect
 {
 public:
 
-    Ten_set_detect()
-        :detector("/home/h/下载/卷轴检测blue/best","cpu",0.75,0.75,0.75)
+    Ten_set_detect()     
+        :detector(model_path,xpu,0.7,0.7,0.7),
+        is_blue_(is_blue)
     {}
 
     // 设置yolo 目标检测的矩形框
@@ -28,33 +29,26 @@ public:
         std::vector<Ten::yolo::Detection> results = detector.worker(image);
         if(results.empty()) return {};
 
-        // 2 取最优结果
-        std::sort(results.begin(), results.end(),
-                    [](const Ten::yolo::Detection &det1, const Ten::yolo::Detection &det2) -> bool
-                    {
-                        double s1 = det1.w_ * det1.h_;
-                        double s2 = det2.w_ * det2.h_;
-                        return s1 > s2;
-                    });
-
-        // 3 遍历所有检测结果，统一转为 cv::Rect 存入容器
+        // 2 遍历所有检测结果，统一转为 cv::Rect 存入容器
         std::vector<cv::Rect> rect_list;
         for (const auto& det : results)
         {
-            float x1 = det.cx_ - det.w_ / 2;
-            float x2 = det.cx_ + det.w_ / 2;
-            float y1 = det.cy_ - det.h_ / 2;
-            float y2 = det.cy_ + det.h_ / 2;
+            std::cout << "det.cls_id_: " << det.cls_id_ << std::endl;
+            if (det.cls_id_ == (2 - is_blue_))    // is_blue_ = 0， cls_id_ = 2 红场蓝方块， is_blue_ = 1， cls_id_ = 1 蓝场红方块
+            {
+                float x1 = det.cx_ - det.w_ / 2;
+                float x2 = det.cx_ + det.w_ / 2;
+                float y1 = det.cy_ - det.h_ / 2;
+                float y2 = det.cy_ + det.h_ / 2;
 
-            cv::Rect roi(
-                cvRound(x1), cvRound(y1),
-                cvRound(x2) - cvRound(x1),   // Rect构造：x,y,width,height
-                cvRound(y2) - cvRound(y1)
-            );
-            rect_list.push_back(roi);
+                cv::Rect roi(
+                    cvRound(x1), cvRound(y1),
+                    cvRound(x2) - cvRound(x1),   // Rect构造：x,y,width,height
+                    cvRound(y2) - cvRound(y1)
+                );
+                rect_list.push_back(roi);
+            }
         }
-
-        // 4 返回结果
         return rect_list;
     }
 
@@ -87,7 +81,8 @@ public:
         for (const cv::Rect& roi : rois)
         {
             // 单个ROI越界校验，非法区域直接跳过
-            if (roi.x < 0 || roi.y < 0 || roi.x + roi.width  > depth_frame.cols || roi.y + roi.height > depth_frame.rows) continue;
+            if (roi.x < 0 || roi.y < 0 || roi.width <= 0 || roi.height <= 0) continue;
+            if (roi.x + roi.width  > depth_frame.cols || roi.y + roi.height > depth_frame.rows) continue;
             pcl::PointCloud<pcl::PointXYZ>::Ptr single_cloud(new pcl::PointCloud<pcl::PointXYZ>);
 
             const int y_end = roi.y + roi.height;
@@ -112,7 +107,7 @@ public:
                     single_cloud->push_back(p);
                 }
             }
-            if (!single_cloud->empty())
+            if (!single_cloud->empty() && single_cloud->size() > 50)
             {
                 pcl_clouds.push_back(single_cloud);
             }
@@ -122,8 +117,8 @@ public:
 
 private:
     Ten::yolo::yolo_v5 detector;
+    int is_blue_ = 1;
 
 };      // class Ten_set_detect
-}       // namespace kfs_locator
-}       // namespace Ten
+}       // namespace Ten::kfs_locator
 #endif 

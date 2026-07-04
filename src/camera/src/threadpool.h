@@ -28,7 +28,8 @@ public:
  
     // 添加任务到线程池
     template<class F, class... Args>
-    void enqueue(F&& f, Args&&... args);
+    auto enqueue(F&& f, Args&&... args) 
+        -> std::future<std::invoke_result_t<F, Args...>>;
     
 private:
     std::vector<std::thread> workers_lists_;           // 线程池
@@ -99,20 +100,29 @@ inline ThreadPool::~ThreadPool()
 }
 
 template<class F, class... Args>
-inline void ThreadPool::enqueue(F&& f, Args&&... args)
+inline auto ThreadPool::enqueue(F&& f, Args&&... args) 
+    -> std::future<std::invoke_result_t<F, Args...>>
 {
-    // 1 创建一个任务，将函数和参数绑定在一起
-    auto task = std::bind(std::forward<F>(f), std::forward<Args>(args)...);
-    // 2 将任务添加到任务队列
+    using ReturnType = std::invoke_result_t<F, Args...>;
+
+    // 1. 用 packaged_task 包装任务，捕获返回值
+    auto task = std::make_shared<std::packaged_task<ReturnType()>>(
+        std::bind(std::forward<F>(f), std::forward<Args>(args)...)
+    );
+
+    // 2. 先拿到 future，再 push 进队列（避免 future 在任务完成后才获取）
+    std::future<ReturnType> result = task->get_future();
+
     {
         std::unique_lock<std::mutex> lock(queue_mutex_);
-        // 如果任务队列已满，则等待
         condition_.wait(lock, [this] { return tasks_queue_.size() < task_max_size_; });
-        // 添加任务到队列
-        tasks_queue_.emplace(std::move(task));
+
+        // 3. 将 packaged_task 包装成 void() 塞入队列
+        tasks_queue_.emplace([task]() { (*task)(); });
     }
-    // 3 通知一个线程有新任务可执行
+
     condition_.notify_one();
+    return result;
 }
 
 } // namespace Ten::threadpool_test

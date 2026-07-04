@@ -16,13 +16,12 @@
 
 namespace Ten::kfs_locator {
     constexpr float BOX_SIZE = 0.35;
-    constexpr float leaf_size_XY = 0.010f;               // 体素滤波XY尺寸，值越大点云越稀疏
-    constexpr float leaf_size_Z  = 0.005f;               // 体素滤波Z尺寸，值越大点云越稀疏
-    constexpr float DistanceThreshold = 0.016f;          // 平面拟合距离阈值，值越大拟合范围越大
-    constexpr int  MaxIterations = 1000;                 // 平面拟合迭代次数，值越大精度越高
+    constexpr float leaf_size_XY = 0.006f;               // 体素滤波XY尺寸，值越大点云越稀疏
+    constexpr float leaf_size_Z  = 0.010f;               // 体素滤波Z尺寸，值越大点云越稀疏
+    constexpr float DistanceThreshold = 0.020f;          // 平面拟合距离阈值，值越大拟合范围越大
+    constexpr int  MaxIterations = 500;                 // 平面拟合迭代次数，值越大精度越高
     constexpr float ClusterTolerance = 0.012;            // 欧式聚类容差，值越大聚类范围越大
-    constexpr int   MinPlaneInliers = 100;               // RANSAC 平面拟合最小内点数，低于此值视为无效
-    constexpr double TopSurfaceAngleThreshold = 35.0;    // 顶面判定角度阈值（度），法向量与光轴夹角小于此值视为顶面
+    constexpr int   MinPlaneInliers = 80;               // RANSAC 平面拟合最小内点数，低于此值视为无效
 
 
     // 存储平面位姿信息
@@ -56,7 +55,7 @@ namespace Ten::kfs_locator {
         );
 
         // 计算平面点云质心与初始姿态
-        void compute_Center(
+        bool compute_Center(
             pcl::PointCloud<pcl::PointXYZ>::Ptr input_cloud,
             Plane_Info& plane_info
         );
@@ -97,7 +96,7 @@ namespace Ten::kfs_locator {
         pcl::PointCloud<pcl::PointXYZ>::Ptr& out_pclclouds
     )
     {
-        if(input_pclclouds->size() <= 50) return false;
+        if(input_pclclouds->size() <= 50 || !input_pclclouds) return false;
 
         // 执行体素降采样
         pcl::PointCloud<pcl::PointXYZ>::Ptr mid_pclclouds(new pcl::PointCloud<pcl::PointXYZ>);
@@ -132,7 +131,7 @@ namespace Ten::kfs_locator {
         ec.extract(cluster_indices);
 
         // 提取主聚类点云
-        if (cluster_indices.empty())
+        if (cluster_indices.empty() || cluster_indices[0].indices.empty())
         {
             *output_cloud = *input_cloud;
             return;
@@ -214,18 +213,6 @@ namespace Ten::kfs_locator {
             return false;
         }
 
-        // 检查平面法向量与光轴（Z轴）的夹角，仅保留顶面
-        const Eigen::Vector3d optical_axis = Eigen::Vector3d::UnitZ();  // 光轴方向 (0,0,1)
-        const double cos_angle = std::abs(plane_info.plane_normal.dot(optical_axis));
-        const double threshold_cos = std::cos(TopSurfaceAngleThreshold * M_PI / 180.0);
-
-        if (cos_angle < threshold_cos)
-        {
-            // 法向量与光轴夹角过大，非顶面，不处理
-            std::cout << "cos_angle: " << cos_angle << " < threshold_cos: " << threshold_cos << std::endl; 
-            return false;
-        }
-
         // 提取平面点云
         extract_Plane_Cloud(input_cloud, plane_inliers, output_cloud);
 
@@ -233,19 +220,25 @@ namespace Ten::kfs_locator {
     }
 
 
-    inline void Ten_set_plane::compute_Center(
+    inline bool Ten_set_plane::compute_Center(
         pcl::PointCloud<pcl::PointXYZ>::Ptr input_cloud,
         Plane_Info& plane_info)
     {
         // 计算点云质心
-        Eigen::Vector4f centroid_float;
+        if (!input_cloud || input_cloud->empty())
+        {
+            plane_info.plane_center = Eigen::Vector3d::Zero();
+            return false;
+        }
+        Eigen::Vector4f centroid_float = Eigen::Vector4f::Zero();
         pcl::compute3DCentroid(*input_cloud, centroid_float);
         plane_info.plane_center = Eigen::Vector3d(centroid_float[0], centroid_float[1], centroid_float[2]);
+        return true;
     }
 
     inline Eigen::Vector3d Ten_set_plane::cal_base_point(const Plane_Info& plane_info)
     {
-        const double offset_distance = BOX_SIZE;
+        const double offset_distance = BOX_SIZE / 2.0;
 
         // 1. 获取平面法向量
         Eigen::Vector3d normal = plane_info.plane_normal;
