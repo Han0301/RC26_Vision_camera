@@ -78,9 +78,13 @@ rosrun camera test_thread_node
 - 精简依赖，专注 KFS 定位功能
 
 ### camera_ws2.3 — 多线程处理版
-- 引入线程池（`threadpool.cpp`）
-- 新增 `test_thread_node` 多线程处理节点
-- 提升图像处理并发能力
+- **新增** `test_thread.cpp`: 多线程处理节点 (`test_thread_node`)
+- **新增** `threadpool.cpp`: 线程池实现
+- **新增** `learn/`: 学习测试目录
+- **新增** CMakeLists.txt 中 test_thread_node 编译目标
+- **重构** `kfs_locator`: 移除 params_loader，优化 set_plane/set_result
+- **移除** `config/` 配置文件目录
+- 引入多线程并行处理架构
 
 ### camera_ws2.4 — 方块位姿识别版
 - 识别 kfs（35cm 方块）位姿

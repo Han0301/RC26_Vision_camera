@@ -25,7 +25,7 @@ class Ten_debug_pcl
 public:
     void publish_pointcloud(
         const pcl::PointCloud<pcl::PointXYZ>::Ptr& pcl_cloud,
-        const std::string frame_id = "camera_color_optical_frame",
+        const std::string frame_id = "map",
         const std::string topic_name = "/camera/pointcloud"
     )
     {
@@ -44,6 +44,24 @@ public:
         ros_cloud.header.frame_id = frame_id;
         ros_cloud.header.stamp = ros::Time::now();
         pcl_pub_.publish(ros_cloud);
+    }
+
+    // ---- 在图像上绘制所有有效 ROI 框 ----
+    static cv::Mat draw_rois(
+        const cv::Mat& image,
+        const std::vector<cv::Rect>& rois,
+        const cv::Scalar& color = cv::Scalar(0, 255, 0),
+        int thickness = 2)
+    {
+        cv::Mat out = image.clone();
+        for (const auto& r : rois)
+        {
+            // 裁剪越界部分，只画在画面内的区域
+            cv::Rect clamped = r & cv::Rect(0, 0, image.cols, image.rows);
+            if (clamped.area() > 0)
+                cv::rectangle(out, clamped, color, thickness);
+        }
+        return out;
     }
 
     void pub_color_image

@@ -2,7 +2,6 @@
 #define __SET_RESULT_H_
 #include "set_plane.h"
 #include "set_detect.h"
-#include "debug_pcl.h"
 #include "../camera.h"
 
 
@@ -26,8 +25,6 @@ public:
         plane_cloud(new pcl::PointCloud<pcl::PointXYZ>)
     {
         color_intr_ = color_intr;
-        depth_show = cv::Mat();
-        debug_image = cv::Mat();
     }
 
     // 执行流程 ---------------------------------------------------------------
@@ -43,9 +40,6 @@ public:
     result set_result();
     // 执行流程 ---------------------------------------------------------------
 
-    // 调试： 发布调试图像和tf， 点云
-    void publish(Ten::camera_frame& frame);
-
     // 取接口
     const std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> get_input_clouds()
     {
@@ -59,28 +53,38 @@ public:
     {
         return state;
     }
+    const std::vector<cv::Rect> get_rois()
+    {
+        return rois_;
+    }
 
 private:
     // 参数
     rs2_intrinsics color_intr_;
     // 处理器
-    Ten::kfs_locator::Ten_debug_pcl DEBUG_PCL_;
     Ten::kfs_locator::Ten_set_detect SET_DETECT_;
     Ten::kfs_locator::Ten_set_plane SET_PLANE_;
     // 中间变量
     Ten::kfs_locator::Plane_Info plane_info;
     std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> input_clouds;
+    std::vector<cv::Rect> rois_;                // 存储最新一次检测的 ROI 框
     pcl::PointCloud<pcl::PointXYZ>::Ptr input_cloud;
     pcl::PointCloud<pcl::PointXYZ>::Ptr filter_cloud;
     pcl::PointCloud<pcl::PointXYZ>::Ptr plane_cloud;
     Eigen::Vector3d key_center;     // 体中心点
-    // 调试相关
-    cv::Mat depth_show;
-    cv::Mat debug_image;
+
+    // 时域滤波（抑制RANSAC帧间抖动）
+    Eigen::Vector3d filtered_normal_ = Eigen::Vector3d::UnitZ(); // EMA 滤波后的法向量
+    bool normal_initialized_ = false;                            // 首帧初始化标记
+    static constexpr double kEmaAlpha = 0.15;                    // EMA 系数：越小越平滑（0.05~0.3）
+
     std::string state = "off";
 
     // 功能函数 计算偏差角度， 确保plane_info已被写入信息
     double calc_deviation_angle(const Eigen::Vector3d& target_plane);
+
+    // 法向量 EMA 时域滤波，抑制 RANSAC 帧间抖动
+    void apply_normal_ema();
 };      // class Ten_set_result
 
 inline bool Ten_set_result::preprocess(Ten::camera_frame& frame)
@@ -92,8 +96,8 @@ inline bool Ten_set_result::preprocess(Ten::camera_frame& frame)
     }
 
     // 设置点云
-    std::vector<cv::Rect> rois = SET_DETECT_.set_roi_detect(frame.bgr_image);
-    bool is_set = SET_DETECT_.set_pcl_clouds(frame.depth_image, color_intr_, rois, input_clouds);
+    rois_ = SET_DETECT_.set_roi_detect(frame.bgr_image);
+    bool is_set = SET_DETECT_.set_pcl_clouds(frame.depth_image, color_intr_, rois_, input_clouds);
     if (!is_set) 
     {
         state = "set_pcl_clouds error!";
@@ -142,20 +146,34 @@ inline bool Ten_set_result::postprocess(const pcl::PointCloud<pcl::PointXYZ>::Pt
         return false;
     }
 
+    // 法向量时域滤波
+    apply_normal_ema();
+
     // 方形拟合
     SET_PLANE_.compute_Center(plane_cloud,plane_info);
-    // 赋值体中心点
-    key_center = SET_PLANE_.cal_center_point(plane_info);
+    // 赋值底面中心点
+    key_center = SET_PLANE_.cal_base_point(plane_info);
     state = "ok";
     return true;
 }
 
-inline void Ten_set_result::publish(Ten::camera_frame& frame)
+inline void Ten_set_result::apply_normal_ema()
 {
-        cv::normalize(frame.depth_image, depth_show, 0, 255, cv::NORM_MINMAX, CV_8UC1);
-        DEBUG_PCL_.pub_depth_image(frame.depth_image, "depth_show");
-        DEBUG_PCL_.pub_color_image(frame.bgr_image, "bgr_image");
-        DEBUG_PCL_.publish_pointcloud(plane_cloud);
+    if (!normal_initialized_)
+    {
+        filtered_normal_ = plane_info.plane_normal.normalized();
+        normal_initialized_ = true;
+    }
+    else
+    {
+        // 先统一方向（防止法向量翻转导致 EMA 振荡）
+        Eigen::Vector3d raw_n = plane_info.plane_normal.normalized();
+        if (raw_n.dot(filtered_normal_) < 0.0)
+            raw_n = -raw_n;
+        filtered_normal_ = (kEmaAlpha * raw_n + (1.0 - kEmaAlpha) * filtered_normal_).normalized();
+    }
+    // 用滤波后的法向量替换原始值
+    plane_info.plane_normal = filtered_normal_;
 }
 
 inline double Ten_set_result::calc_deviation_angle(const Eigen::Vector3d& target_plane)
@@ -185,18 +203,33 @@ inline double Ten_set_result::calc_deviation_angle(const Eigen::Vector3d& target
 inline result Ten_set_result::set_result()
 {
     result out;
-    const Eigen::Vector3d target_plane(0.0, 0.0, 1.0);
-    const Eigen::Vector3d line_point(0.0, 0.0, 0.0);
 
-    // 点垂直投影到目标平面
-    Eigen::Vector3d proj_center = key_center - target_plane.dot(key_center) * target_plane;
+    // ── 1. 底面方程：n·(X - key_center) = 0 ──
+    //     顶面法向量 = 底面法向量（方块上下底面平行）
+    const Eigen::Vector3d n = plane_info.plane_normal.normalized();
 
-    // 计算投影点到目标直线的距离
-    Eigen::Vector3d vec = proj_center - line_point;
-    out.x = vec.x();
-    out.y = vec.y();
-    out.z = key_center.z();
-    out.bia_radian = calc_deviation_angle(target_plane);
+    // ── 2. 将光心（原点）投影到底面 ──
+    //     投影公式：P_proj = (key_center·n) * n
+    const double d = key_center.dot(n);               // 光心到底面的有向距离
+    const Eigen::Vector3d P_proj = d * n;             // 光心在底面上的投影点
+
+    // ── 3. 在底面上建立正交 2D 坐标系 ──
+    //     x_axis：相机 X 轴 (1,0,0) 投影到底面 → 面内水平方向
+    //     y_axis：相机 Y/Z 投影到底面 → 共线（正交于 x_axis 的面内方向）
+    //             用 n × x_axis 保证正交
+    Eigen::Vector3d x_axis = Eigen::Vector3d::UnitX() - n.x() * n;
+    x_axis.normalize();
+    Eigen::Vector3d y_axis = n.cross(x_axis);         // 右手系，在底面内 ⊥ x_axis
+
+    // ── 4. 计算底面中心在投影点坐标系中的坐标 ──
+    const Eigen::Vector3d offset = key_center - P_proj; // 底面内：投影点 → 底面中心
+    out.x = offset.dot(x_axis);
+    out.y = offset.dot(y_axis);
+    out.z = d;                                        // 光心到底面的距离（深度）
+
+    // ── 5. 偏差角度 ──
+    out.bia_radian = calc_deviation_angle(Eigen::Vector3d::UnitZ());
+
     return out;
 }
 

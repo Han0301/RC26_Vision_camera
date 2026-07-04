@@ -22,6 +22,7 @@ namespace Ten::kfs_locator {
     constexpr int  MaxIterations = 1000;                 // 平面拟合迭代次数，值越大精度越高
     constexpr float ClusterTolerance = 0.012;            // 欧式聚类容差，值越大聚类范围越大
     constexpr int   MinPlaneInliers = 100;               // RANSAC 平面拟合最小内点数，低于此值视为无效
+    constexpr double TopSurfaceAngleThreshold = 35.0;    // 顶面判定角度阈值（度），法向量与光轴夹角小于此值视为顶面
 
 
     // 存储平面位姿信息
@@ -47,7 +48,7 @@ namespace Ten::kfs_locator {
             pcl::PointCloud<pcl::PointXYZ>::Ptr& out_pclclouds
         );
 
-        // 平面拟合与点云提取
+        // 平面拟合与点云提取(只提取顶面)
         bool Plane_fitter(
             const pcl::PointCloud<pcl::PointXYZ>::Ptr& input_cloud,
             pcl::PointCloud<pcl::PointXYZ>::Ptr& output_cloud,
@@ -60,7 +61,7 @@ namespace Ten::kfs_locator {
             Plane_Info& plane_info
         );
 
-        Eigen::Vector3d cal_center_point(const Plane_Info& plane_info);
+        Eigen::Vector3d cal_base_point(const Plane_Info& plane_info);
 
     private:
         // 体素网格降采样
@@ -213,6 +214,18 @@ namespace Ten::kfs_locator {
             return false;
         }
 
+        // 检查平面法向量与光轴（Z轴）的夹角，仅保留顶面
+        const Eigen::Vector3d optical_axis = Eigen::Vector3d::UnitZ();  // 光轴方向 (0,0,1)
+        const double cos_angle = std::abs(plane_info.plane_normal.dot(optical_axis));
+        const double threshold_cos = std::cos(TopSurfaceAngleThreshold * M_PI / 180.0);
+
+        if (cos_angle < threshold_cos)
+        {
+            // 法向量与光轴夹角过大，非顶面，不处理
+            std::cout << "cos_angle: " << cos_angle << " < threshold_cos: " << threshold_cos << std::endl; 
+            return false;
+        }
+
         // 提取平面点云
         extract_Plane_Cloud(input_cloud, plane_inliers, output_cloud);
 
@@ -230,9 +243,9 @@ namespace Ten::kfs_locator {
         plane_info.plane_center = Eigen::Vector3d(centroid_float[0], centroid_float[1], centroid_float[2]);
     }
 
-    inline Eigen::Vector3d Ten_set_plane::cal_center_point(const Plane_Info& plane_info)
+    inline Eigen::Vector3d Ten_set_plane::cal_base_point(const Plane_Info& plane_info)
     {
-        const double offset_distance = BOX_SIZE / 2.0;
+        const double offset_distance = BOX_SIZE;
 
         // 1. 获取平面法向量
         Eigen::Vector3d normal = plane_info.plane_normal;
@@ -246,7 +259,7 @@ namespace Ten::kfs_locator {
             normal = -normal;
         }
 
-        // 3. 沿法向量（远离相机、指向物体内部）偏移半厚度
+        // 3. 沿法向量（远离相机、指向物体内部）偏移厚度
         Eigen::Vector3d body_center = plane_center + normal * offset_distance;
         return body_center;
     }
