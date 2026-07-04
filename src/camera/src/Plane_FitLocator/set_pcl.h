@@ -2,14 +2,13 @@
 #define __SET_PCL_H_
 #include <ros/ros.h>
 #include <iostream>
-#include <string>
 #include <sensor_msgs/PointCloud2.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_types.h>
-#include <pcl/filters/statistical_outlier_removal.h>
+#include "../yolo/yolo_v5.h"
 
-#define CloudDepth_low 100
-#define CloudDepth_high 1000
+#define CloudDepth_min 200
+#define CloudDepth_max 1800
 
 namespace Ten
 {
@@ -19,33 +18,68 @@ class Ten_set_pcl
 {
 public:
 
+    Ten_set_pcl()
+        :detector("/home/h/下载/卷轴检测red/best","cpu",0,0.5,0.5)
+    {}
+
+    // 设置yolo 目标检测的矩形框
+    cv::Rect set_roi_detect(const cv::Mat &image)
+    {
+        // 1 调用worker函数
+        std::vector<Ten::yolo::Detection> results = detector.worker(const_cast<cv::Mat&>(image));
+        if(results.empty()) return cv::Rect();
+
+        std::cout << "results.size(): " << results.size() << std::endl;
+        // 2 取最优结果
+        std::sort(results.begin(), results.end(),
+                    [](const Ten::yolo::Detection &det1, const Ten::yolo::Detection &det2) -> bool
+                    {
+                        double s1 = det1.w_ * det1.h_;
+                        double s2 = det2.w_ * det2.h_;
+                        return s1 > s2;
+                    });
+        Ten::yolo::Detection best = results[0];       // 检测框中心点坐标和宽高
+
+        // 3 计算框边界坐标
+        float x1 = best.cx_ - best.w_ / 2;
+        float x2 = best.cx_ + best.w_ / 2;
+        float y1 = best.cy_ - best.h_ / 2;
+        float y2 = best.cy_ + best.h_ / 2;
+        return cv::Rect(cv::Point2i(cvRound(x1), cvRound(y1)),      // 四舍五入给结果
+                        cv::Point2i(cvRound(x2), cvRound(y2)));
+    }
+
     /**
      * @brief 根据深度图像， 内参， 直接转成pcl点云
      * @param depth_frame       原生深度帧
      * @param color_intr        彩色相机内参
+     * @param roi               yolo检测处的rect框
      * @param pcl_cloud         输出的pcl_cloud点云
     */
-    void set_Pcl_Cloud(
-        const std::shared_ptr<rs2::depth_frame>& depth_frame,
+    bool set_Pcl_Cloud(
+        const cv::Mat& depth_frame,
         const rs2_intrinsics& color_intr,
+        const cv::Rect& roi,
         pcl::PointCloud<pcl::PointXYZ>::Ptr& pcl_cloud
     )
     {
+        // 安全性校验和输出重置
+        if (roi.empty()) return false;
+        if (roi.x < 0 || roi.y < 0 || roi.x + roi.width > depth_frame.cols || roi.y + roi.height > depth_frame.rows) return false;
         pcl_cloud->clear();
-        int w = depth_frame->get_width();
-        int h = depth_frame->get_height();
 
-        for (int v = 0; v < h; v++) {
-            for (int u = 0; u < w; u++) {
-                // 原生精准深度（0.1mm精度，斜视角无误差）
-                float z = depth_frame->get_distance(u, v); 
-                int z_mm = int(z * 1000);
+        int y_end = roi.y + roi.height;
+        int x_end = roi.x + roi.width;
+        for (int v = roi.y; v < y_end; v++) 
+        {
+            for (int u = roi.x; u < x_end; u++) 
+            {
+                uint16_t z_mm = depth_frame.ptr<uint16_t>(v)[u];
 
-                // 过滤无效深度
-                if (z <= 0 || z_mm < CloudDepth_low || z_mm > CloudDepth_high)
-                    continue;
+                if (z_mm < CloudDepth_min || z_mm > CloudDepth_max) continue;
+                float z = z_mm * 0.001f;
 
-                // 反投影（align后用彩色内参，坐标系100%对齐）
+                // 反投影
                 float pixel[2] = {(float)u, (float)v};
                 float point3d[3] = {0};
                 rs2_deproject_pixel_to_point(point3d, &color_intr, pixel, z);
@@ -57,13 +91,14 @@ public:
                 pcl_cloud->push_back(p);
             }
         }
+        return true;
     }
 
+
 private:
+    Ten::yolo::yolo_v5 detector;
 
-
-};
-
+};      // class Ten_set_pcl
 }       // namespace Plane_FitLocator
 }       // namespace Ten
 #endif 

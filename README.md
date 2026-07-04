@@ -63,9 +63,11 @@ rosrun camera test_thread_node
 - **精简** CMakeLists.txt，去除 OpenVINO 和 Realsense 依赖
 - 单一 `test_node` 节点，专注 YOLO 检测
 
-### camera_ws2 — YOLO 改进版
-- 优化 YOLO 集成方式
-- 改进相机处理流程
+### camera_ws2 — YOLO + OpenVINO 融合版
+- **恢复** `openvino.cpp/h`: OpenVINO 推理重新集成
+- **新增** `plane_fit.h`: 点云平面拟合模块
+- 融合 YOLO 检测与 OpenVINO 推理优化
+- 优化 Plane_FitLocator 点云处理管线
 
 ### camera_ws2.22 — 基础稳定版
 - 精简稳定的相机驱动版本
