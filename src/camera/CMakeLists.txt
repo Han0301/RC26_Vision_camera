@@ -41,7 +41,6 @@ find_package(catkin REQUIRED COMPONENTS
   tf2_msgs
   tf2_ros
   vision_msgs
-  # realsense2_msgs        # 新增：原生RealSense帧消息
 )
 find_package(OpenVINO REQUIRED)
 
@@ -175,10 +174,6 @@ add_executable(test_node
 src/test.cpp
 )
 
-add_executable(test_pnp_node 
-src/test_pnp.cpp
-)
-
 ## Rename C++ executable without prefix
 ## The above recommended prefix causes long target names, the following renames the
 ## target back to the shorter version for ease of user use
@@ -193,27 +188,13 @@ src/test_pnp.cpp
 
 target_sources(test_node
   PRIVATE
+  src/yolo/yolo_base.cpp
   src/camera.cpp
   src/method_math.cpp
-  src/openvino.cpp
 )
+
 
 target_link_libraries(test_node
-  ${catkin_LIBRARIES}
-  openvino::runtime
-  ${realsense2_INCLUDE_DIR}
-  /usr/lib/x86_64-linux-gnu/librealsense2.so
-)
-
-target_sources(test_pnp_node
-  PRIVATE
-  src/camera.cpp
-  src/method_math.cpp
-  src/openvino.cpp
-)
-
-
-target_link_libraries(test_pnp_node
   ${catkin_LIBRARIES}
   openvino::runtime
   ${realsense2_INCLUDE_DIR}

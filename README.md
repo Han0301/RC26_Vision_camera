@@ -56,9 +56,12 @@ rosrun camera test_thread_node
 - 更新 PnP 调试与参数配置
 
 ### camera_ws — YOLO 初始版
-- 引入 YOLO 目标检测（`yolo_base.cpp`）
-- 移除 OpenVINO 和 PnP 相关依赖
-- 单一 `test_node` 节点
+- **引入** YOLO 目标检测（`yolo_base.cpp` + 多种模型适配）
+- **移除** OpenVINO 推理模块
+- **移除** PnP 位姿解算模块（`PnP/` 目录）
+- **移除** `test_pnp_node` 节点
+- **精简** CMakeLists.txt，去除 OpenVINO 和 Realsense 依赖
+- 单一 `test_node` 节点，专注 YOLO 检测
 
 ### camera_ws2 — YOLO 改进版
 - 优化 YOLO 集成方式
