@@ -2,481 +2,373 @@
 #include <iostream>
 #include <iomanip>
 #include <fstream>
+#include <sstream>
 #include <limits>
 #include <string>
 #include <vector>
 #include <utility>
 #include <cmath>
 #include <cstdlib>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <algorithm>
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <termios.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include <ros/ros.h>
+#include <cv_bridge/cv_bridge.h>
+#include <image_transport/image_transport.h>
+#include <sensor_msgs/image_encodings.h>
 #include "camera.h"
+#include "apriltag_detect/apriltag_detector.h"
+#include "apriltag_detect/apriltag_debug.h"
 
-#include <rosbag/bag.h>
-#include <rosbag/view.h>
-#include "./kfs_locator/set_result.h"
-#include "./kfs_locator/debug_pcl.h"
+// ---------- 非阻塞键盘输入 ----------
+static struct termios g_original_tio;
 
-rosbag::Bag g_bag;
-rosbag::View* g_view = nullptr;
-rosbag::View::iterator g_msg_iter;
-
-bool init_bag_player(const std::string& bag_path)
+static void setupNonBlockingInput()
 {
-    try
-    {
-        g_bag.open(bag_path, rosbag::bagmode::Read);
-        std::vector<std::string> topics = {"/bgr_image","/depth_show"};
-        g_view = new rosbag::View(g_bag, rosbag::TopicQuery(topics));
-        g_msg_iter = g_view->begin();
+    tcgetattr(STDIN_FILENO, &g_original_tio);
+    struct termios tio = g_original_tio;
+    tio.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &tio);
+    int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags | O_NONBLOCK);
+}
 
-        std::cout << "✅ bag初始化成功" << std::endl;
-        return true;
-    }
-    catch (const std::exception& e)
+static void restoreInput()
+{
+    tcsetattr(STDIN_FILENO, TCSANOW, &g_original_tio);
+}
+
+// 非阻塞读取一个字符, 无输入返回 -1
+static int nb_getchar()
+{
+    char c;
+    int r = read(STDIN_FILENO, &c, 1);
+    return (r == 1) ? (int)c : -1;
+}
+
+// ---------- 目录创建 ----------
+static void ensureDir(const std::string& path)
+{
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0)
+        mkdir(path.c_str(), 0755);
+}
+
+// ---------- 录制控制状态 ----------
+struct RecordState
+{
+    bool     active    = false;
+    int      frame_cnt = 0;
+    int      save_cnt  = 0;
+    std::string images_dir;
+    std::string labels_dir;
+
+    RecordState(const std::string& base_dir = "/home/h/output")
+        : images_dir(base_dir + "/images")
+        , labels_dir(base_dir + "/labels")
     {
-        std::cerr << "❌ 初始化失败：" << e.what() << std::endl;
-        return false;
+        ensureDir(base_dir);
+        ensureDir(images_dir);
+        ensureDir(labels_dir);
+    }
+};
+
+// ---------- 显示线程共享数据 ----------
+struct DisplayFrame
+{
+    cv::Mat image;
+    bool    detected = false;
+    std::vector<Ten::apriltag_detect::TagDetection> tags;
+    bool    recording = false;
+    int     frame_cnt = 0;
+    int     save_cnt  = 0;
+};
+
+static std::mutex    g_disp_mutex;
+static DisplayFrame  g_disp_frame;
+static std::atomic<bool> g_disp_running{true};
+static std::atomic<bool> g_quit_from_gui{false};
+
+// 在显示帧上绘制检测框
+static void drawDetections(cv::Mat& img,
+                           const std::vector<Ten::apriltag_detect::TagDetection>& tags)
+{
+    for (const auto& t : tags)
+    {
+        // 外接矩形
+        cv::rectangle(img,
+                      cv::Point((int)t.bbox[0], (int)t.bbox[1]),
+                      cv::Point((int)t.bbox[2], (int)t.bbox[3]),
+                      cv::Scalar(0, 255, 0), 2);
+
+        // 4个角点
+        for (int j = 0; j < 4; ++j)
+            cv::circle(img,
+                       cv::Point((int)t.corners[j][0], (int)t.corners[j][1]),
+                       3, cv::Scalar(0, 0, 255), -1);
+
+        // 中心点
+        cv::circle(img,
+                   cv::Point((int)t.center[0], (int)t.center[1]),
+                   4, cv::Scalar(255, 0, 0), -1);
+
+        // 标签 ID
+        cv::putText(img,
+                    "ID:" + std::to_string(t.id),
+                    cv::Point((int)t.bbox[0], (int)t.bbox[1] - 5),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                    cv::Scalar(0, 255, 0), 2);
     }
 }
 
-Ten::camera_frame get_next_frame_from_bag()
+// 显示线程
+static void displayThread()
 {
-    Ten::camera_frame frame;
-    cv::Mat color_img, depth_img;
+    cv::namedWindow("AprilTag Detection", cv::WINDOW_NORMAL);
+    cv::resizeWindow("AprilTag Detection", 640, 480);
 
-    while (g_msg_iter != g_view->end())
+    while (g_disp_running.load())
     {
-        rosbag::MessageInstance const msg = *g_msg_iter;
-        ++g_msg_iter;
-
-        // 彩色图（不变）
-        if (msg.getTopic() == "/bgr_image")
+        cv::Mat disp;
         {
-            auto img_msg = msg.instantiate<sensor_msgs::Image>();
-            if (img_msg) color_img = cv_bridge::toCvCopy(img_msg, sensor_msgs::image_encodings::BGR8)->image;
-        }
-        // 深度图（不变）
-        if (msg.getTopic() == "/depth_show")
-        {
-            auto img_msg = msg.instantiate<sensor_msgs::Image>();
-            if (img_msg) depth_img = cv_bridge::toCvCopy(img_msg, sensor_msgs::image_encodings::TYPE_16UC1)->image;
+            std::lock_guard<std::mutex> lock(g_disp_mutex);
+            if (!g_disp_frame.image.empty())
+                g_disp_frame.image.copyTo(disp);
         }
 
-        // 仅赋值 cv::Mat，删除 raw_depth_frame 相关代码
-        if (!color_img.empty() && !depth_img.empty())
+        if (!disp.empty())
         {
-            frame.bgr_image = color_img;
-            frame.depth_image = depth_img;
-            return frame;
-        }
-    }
+            // 绘制检测框
+            if (!g_disp_frame.tags.empty())
+                drawDetections(disp, g_disp_frame.tags);
 
-    std::cout << "🔄 bag循环播放" << std::endl;
-    g_msg_iter = g_view->begin();
-    return frame;
-}
+            // 状态文字
+            std::string rec_str = g_disp_frame.recording ? "REC ON" : "REC OFF";
+            cv::Scalar rec_color = g_disp_frame.recording
+                                   ? cv::Scalar(0, 0, 255)
+                                   : cv::Scalar(128, 128, 128);
+            cv::putText(disp, rec_str,
+                        cv::Point(10, 25),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.8, rec_color, 2);
 
-rs2_intrinsics createManualIntrinsics()
-{
-    rs2_intrinsics intr;
-    // 1. 核心参数：直接填写你的相机内参
-    intr.fx  = 553.7294;   // 焦距x
-    intr.fy  = 553.7891;   // 焦距y
-    intr.ppx = 317.2345;   // 主点x
-    intr.ppy = 239.7654;   // 主点y
-
-    // 2. 固定默认参数（不影响你的相机矩阵，无需修改）
-    intr.width  = 640;  // 图像宽
-    intr.height = 480;  // 图像高
-    intr.model  = RS2_DISTORTION_BROWN_CONRADY; // 畸变模型（默认）
-    for (int i = 0; i < 5; i++) intr.coeffs[i] = 0; // 畸变系数全0
-
-    return intr;
-}
-
-void test1_frombag(const std::string& bag_path)
-{
-    if (!init_bag_player(bag_path)) return;
-
-    // 参数
-    rs2_intrinsics color_intr = createManualIntrinsics();
-    Ten::kfs_locator::Ten_set_result plane_fiter(color_intr);
-    Ten::XYZRPY bias;
-    Ten::kfs_locator::Ten_debug_pcl debug_pcl;
-
-    // 临时文件路径（根据 bag 文件名生成唯一目录）
-    std::string bag_name = bag_path;
-    size_t slash = bag_name.find_last_of("/\\");
-    if (slash != std::string::npos) bag_name = bag_name.substr(slash + 1);
-    size_t dot = bag_name.find_last_of(".");
-    if (dot != std::string::npos) bag_name = bag_name.substr(0, dot);
-    const std::string tmp_dir = "/tmp/kfs_" + bag_name + "/";
-    system(("mkdir -p " + tmp_dir).c_str());
-    const std::string path_x     = tmp_dir + "x.txt";
-    const std::string path_y     = tmp_dir + "y.txt";
-    const std::string path_z     = tmp_dir + "z.txt";
-    const std::string path_angle = tmp_dir + "angle.txt";
-    const std::string path_pcl   = tmp_dir + "pcl_count.txt";
-
-    // 清空旧临时文件
-    for (const auto* p : {&path_x, &path_y, &path_z, &path_angle, &path_pcl})
-        std::ofstream(*p, std::ios::trunc).close();
-
-    // 预计算有效帧对数量
-    int bag_frame_pairs = 0;
-    for (auto it = g_view->begin(); it != g_view->end(); ++it)
-        if (it->getTopic() == "/bgr_image") ++bag_frame_pairs;
-    g_msg_iter = g_view->begin();
-
-    int total_frames   = 0;
-    int success_frames = 0;
-
-    // ── 逐帧处理（只跑一轮） ──
-    while (ros::ok() && total_frames < bag_frame_pairs)
-    {
-        Ten::camera_frame frame = get_next_frame_from_bag();
-        ++total_frames;
-
-        debug_pcl.pub_depth_image(frame.depth_image, "depth_show");
-        debug_pcl.pub_color_image(frame.bgr_image, "bgr_image");
-        bool is_pre_ok = plane_fiter.preprocess(frame);
-        std::cout << "state: " <<  plane_fiter.get_state() << std::endl;
-
-        if (is_pre_ok)
-        {
-            std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> input_clouds = plane_fiter.get_input_clouds();
-            debug_pcl.publish_pointcloud(plane_fiter.get_plane_cloud());
-            bool is_post_ok = plane_fiter.postprocess();
-            std::cout << "state: " <<  plane_fiter.get_state() << std::endl;
-            if (is_post_ok)
+            if (g_disp_frame.recording)
             {
-                Ten::kfs_locator::result result = plane_fiter.set_result(bias);
-                ++success_frames;
-
-                debug_pcl.save_bias(result.x,                        path_x);
-                debug_pcl.save_bias(result.y,                        path_y);
-                debug_pcl.save_bias(result.z,                        path_z);
-                debug_pcl.save_bias(result.bia_radian * 180.0 / M_PI, path_angle);
-                debug_pcl.save_bias(static_cast<double>(plane_fiter.get_filter_cloud()->size()), path_pcl);
+                cv::putText(disp,
+                            "frame:" + std::to_string(g_disp_frame.frame_cnt) +
+                            " saved:" + std::to_string(g_disp_frame.save_cnt),
+                            cv::Point(10, 55),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.5,
+                            cv::Scalar(255, 255, 0), 1);
             }
+
+            cv::imshow("AprilTag Detection", disp);
         }
 
-        // 调试发布
-        debug_pcl.publish_pointcloud(plane_fiter.get_plane_cloud());
-        cv::Mat drawn = Ten::kfs_locator::Ten_debug_pcl::draw_rois(frame.bgr_image, plane_fiter.get_rois());
-        debug_pcl.pub_color_image(drawn, "drown_rois");
-        ros::spinOnce();
-        ros::Duration(0.05).sleep();  // 给 rqt 订阅者连接时间
+        // waitKey 返回按键, 'q' 或 ESC 退出
+        int k = cv::waitKey(16);  // ~60fps 刷新率
+        if (k == 'q' || k == 'Q' || k == 27)
+        {
+            g_quit_from_gui.store(true);
+            g_disp_running.store(false);
+            break;
+        }
     }
 
-    // 关闭 bag
-    g_bag.close();
-    delete g_view;
-    g_view = nullptr;
-
-    // ── 打印统计 ──
-    double success_rate = (total_frames > 0) ? 100.0 * success_frames / total_frames : 0.0;
-
-    std::cout << "\n=========================================" << std::endl;
-    std::cout << "   静态跳变统计结果  (" << bag_path << ")" << std::endl;
-    std::cout << "=========================================" << std::endl;
-    std::cout << "总帧数: " << total_frames
-              << " | 成功帧数: " << success_frames
-              << " | 成功率: " << std::fixed << std::setprecision(1)
-              << success_rate << "%" << std::endl;
-    std::cout << "=========================================" << std::endl;
-
-    auto print_stats = [&](const std::string& label, const std::string& path) {
-        auto s = debug_pcl.read_bias(path);
-        std::cout << "\n── " << label << " ──" << std::endl;
-        std::cout << std::fixed << std::setprecision(4);
-        std::cout << "  平均值 (avg):       " << s["avg"] << std::endl;
-        std::cout << "  标准差 (std):       " << s["standard_bias"] << std::endl;
-        std::cout << "  跳变幅度 (Δ):       " << s["delta"] << std::endl;
-        std::cout << "  90%范围 (P95-P5):   " << s["90%_range"] << std::endl;
-        std::cout << "  最大值 (max):       " << s["max"] << std::endl;
-        std::cout << "  最小值 (min):       " << s["min"] << std::endl;
-    };
-
-    print_stats("X (m)",        path_x);
-    print_stats("Y (m)",        path_y);
-    print_stats("Z (m)",        path_z);
-    print_stats("Angle (deg)",  path_angle);
-    print_stats("滤波后点数",    path_pcl);
-
-    std::cout << "\n=========================================" << std::endl;
     cv::destroyAllWindows();
 }
 
-void test1_fromframe()
+// ---------- YOLOv5 格式 JSON 生成 ----------
+static void saveYoloJson(const std::string& json_path,
+                         const std::string& image_name,
+                         int img_w, int img_h,
+                         const std::vector<Ten::apriltag_detect::TagDetection>& detections)
 {
-    Ten::Ten_camera& _CAMERA_ = Ten::Ten_camera::GetInstance();
-    _CAMERA_.reset_camera_depth(640, 480,30);
-
-    // 参数
-    rs2_intrinsics color_intr = _CAMERA_.get_color_intrinsics();    // 彩色内参 → 绘图用
-    Ten::kfs_locator::Ten_set_result plane_fiter(color_intr);
-    Ten::kfs_locator::Ten_debug_pcl debug_pcl;
-    Ten::XYZRPY bias;
-    while (ros::ok())
+    std::ofstream ofs(json_path);
+    if (!ofs.is_open())
     {
-        // 设置输入图像
-        Ten::camera_frame frame = _CAMERA_.camera_read_depth();
-        // 处理流程
-        bool is_pre_ok = plane_fiter.preprocess(frame);
-        std::cout << "state: " <<  plane_fiter.get_state() << std::endl;
-        if (is_pre_ok)
-        {
-            // 设置输入点云列表
-            std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> input_clouds = plane_fiter.get_input_clouds();
-            std::cout << "input_clouds size: " << input_clouds.size() << std::endl;
-            // 将输出点云直接给postprocess函数
-            bool is_post_ok = plane_fiter.postprocess();        // 置空输入点云，使用点云列表中的第一个点云
-            std::cout << "state: " <<  plane_fiter.get_state() << std::endl;
-            if (is_post_ok)
-            {
-                Ten::kfs_locator::result out = plane_fiter.set_result(bias);
-                double angle = out.bia_radian;
-                std::cout << "angle: " <<  (angle * 180.0 / M_PI) << std::endl;
-                std::cout << "res.x: " <<  out.x << std::endl;
-                std::cout << "res.y: " <<  out.y << std::endl;
-                std::cout << "res.z: " <<  out.z << std::endl;
-            }
-        }
-
-        // 调试发布
-
-        // pcl::PointCloud<pcl::PointXYZ>::Ptr merged(new pcl::PointCloud<pcl::PointXYZ>);
-        // for (const auto& cloud : plane_fiter.get_input_clouds())
-        // {
-        //     *merged += *cloud;
-        // }
-        // debug_pcl.publish_pointcloud(merged);
-        // // 画框并发布
-        // cv::Mat drawn = Ten::kfs_locator::Ten_debug_pcl::draw_rois(frame.bgr_image, plane_fiter.get_rois());
-        // debug_pcl.pub_color_image(drawn, "drown_rois");
-        debug_pcl.pub_depth_image(frame.depth_image, "depth_show");
-        debug_pcl.pub_color_image(frame.bgr_image, "bgr_image");
-        ros::spinOnce();
-    }
-}
-
-// 测量静态偏差：逐帧处理 bag，写入 x/y/z/angle 到 4 个文件，结束后打印统计
-// 支持批量处理：传入 bag 路径列表，依次处理每个 bag，汇总结果写入文件
-void test2_frombag()
-{
-    // ── 1. 定义待处理的 bag 列表 ──
-    // 每个元素: {bag文件路径, 标签(用于输出文件夹命名)}
-    const std::vector<std::pair<std::string, std::string>> bag_list = {
-        {"/home/h/1.05m距离面静态1.bag", "1.05m距离面静态1"},
-        {"/home/h/1.2m距离面静态1.bag",  "1.2m距离面静态1"},
-        {"/home/h/1.2m距离面静态2.bag",  "1.2m距离面静态2"},
-        {"/home/h/1.2m距离面静态3.bag",  "1.2m距离面静态3"},
-        {"/home/h/1.2m距离面静态4.bag",  "1.2m距离面静态4"},
-        {"/home/h/1.35m距离面静态1.bag", "1.35m距离面静态1"},
-        {"/home/h/1.35m距离面静态2.bag", "1.35m距离面静态2"},
-        {"/home/h/1.35m距离面静态3.bag", "1.35m距离面静态3"},
-        {"/home/h/1.35m距离面静态4.bag", "1.35m距离面静态4"},
-        {"/home/h/1.5m距离面静态1.bag",  "1.5m距离面静态1"},
-        {"/home/h/1.5m距离面静态2.bag",  "1.5m距离面静态2"},
-        {"/home/h/1.5m距离面静态3.bag",  "1.5m距离面静态3"},
-        {"/home/h/1.5m距离面静态4.bag",  "1.5m距离面静态4"},
-        {"/home/h/1.8m距离面静态1.bag",  "1.8m距离面静态1"},
-        {"/home/h/1.8m距离面静态2.bag",  "1.8m距离面静态2"},
-        {"/home/h/1.8m距离面静态3.bag",  "1.8m距离面静态3"},
-        {"/home/h/1.8m距离面静态4.bag",  "1.8m距离面静态4"},
-        {"/home/h/2.1m距离面静态1.bag",  "2.1m距离面静态1"},
-        {"/home/h/2.1m距离面静态2.bag",  "2.1m距离面静态2"},
-        {"/home/h/2.1m距离面静态3.bag",  "2.1m距离面静态3"},
-        {"/home/h/2.1m距离面静态4.bag",  "2.1m距离面静态4"},
-        {"/home/h/2.4m距离面静态1.bag",  "2.4m距离面静态1"},
-        {"/home/h/2.4m距离面静态2.bag",  "2.4m距离面静态2"},
-        {"/home/h/2.4m距离面静态3.bag",  "2.4m距离面静态3"},
-        {"/home/h/2.4m距离面静态4.bag",  "2.4m距离面静态4"},
-        {"/home/h/2.65m距离面静态1.bag", "2.65m距离面静态1"},
-        {"/home/h/2.65m距离面静态2.bag", "2.65m距离面静态2"},
-        {"/home/h/2.65m距离面静态3.bag", "2.65m距离面静态3"},
-        {"/home/h/2.65m距离面静态4.bag", "2.65m距离面静态4"},
-    };
-
-    // 输出根目录
-    const std::string output_root = "/home/h/RC2026/camera_ws2.4/debug/";
-    // 汇总统计文件
-    const std::string summary_path = output_root + "summary_stats.txt";
-
-    // ── 2. 打开汇总文件（覆盖模式） ──
-    std::ofstream summary_file(summary_path, std::ios::trunc);
-    if (!summary_file.is_open())
-    {
-        std::cerr << "❌ 无法创建汇总文件：" << summary_path << std::endl;
+        std::cerr << "[JSON] Failed to open: " << json_path << std::endl;
         return;
     }
-    summary_file << std::fixed << std::setprecision(4);
-    summary_file << "================================================\n";
-    summary_file << "         多 Bag 静态跳变统计汇总\n";
-    summary_file << "================================================\n";
-    summary_file << "生成时间: " << __DATE__ << " " << __TIME__ << "\n\n";
 
-    // ── 3. 逐 bag 处理 ──
-    for (size_t bag_idx = 0; bag_idx < bag_list.size(); ++bag_idx)
+    ofs << "[\n";
+    for (size_t i = 0; i < detections.size(); ++i)
     {
-        const std::string& bag_path = bag_list[bag_idx].first;
-        const std::string& bag_label = bag_list[bag_idx].second;
-
-        std::cout << "\n🔵 [" << (bag_idx + 1) << "/" << bag_list.size()
-                  << "] 开始处理: " << bag_label
-                  << "  (" << bag_path << ")" << std::endl;
-
-        if (!init_bag_player(bag_path))
+        const auto& d = detections[i];
+        ofs << "  {\n";
+        ofs << "    \"name\": \"apriltag_" << d.id << "\",\n";
+        ofs << "    \"class\": 0,\n";
+        ofs << "    \"confidence\": " << std::fixed << std::setprecision(4) << d.confidence << ",\n";
+        ofs << "    \"bbox\": {\n";
+        ofs << "      \"x1\": " << d.bbox[0] << ",\n";
+        ofs << "      \"y1\": " << d.bbox[1] << ",\n";
+        ofs << "      \"x2\": " << d.bbox[2] << ",\n";
+        ofs << "      \"y2\": " << d.bbox[3] << "\n";
+        ofs << "    },\n";
+        ofs << "    \"image_size\": {\"width\": " << img_w << ", \"height\": " << img_h << "},\n";
+        ofs << "    \"image_name\": \"" << image_name << "\",\n";
+        ofs << "    \"corners\": [\n";
+        for (int j = 0; j < 4; ++j)
         {
-            std::cerr << "⚠️  跳过失败的 bag: " << bag_path << std::endl;
-            summary_file << "⚠️  [" << bag_label << "] 初始化失败，跳过\n\n";
+            ofs << "      [" << d.corners[j][0] << ", " << d.corners[j][1] << "]";
+            ofs << (j < 3 ? ",\n" : "\n");
+        }
+        ofs << "    ]\n";
+        ofs << "  }" << (i < detections.size() - 1 ? "," : "") << "\n";
+    }
+    ofs << "]\n";
+    ofs.close();
+}
+
+// ---------- 主循环 ----------
+void test()
+{
+    Ten::Ten_camera& camera = Ten::Ten_camera::GetInstance();
+    camera.reset_camera(640, 480, 60);
+    Ten::apriltag_detect::AprilTagDetector Apriltag_d;
+
+    setupNonBlockingInput();
+
+    // 启动显示线程
+    std::thread disp_thread(displayThread);
+
+    RecordState rec("/home/h/output");
+    std::cout << "======================================" << std::endl;
+    std::cout << "  Keyboard / GUI Control:" << std::endl;
+    std::cout << "    press 'i' to START recording" << std::endl;
+    std::cout << "    press 'o' to STOP  recording" << std::endl;
+    std::cout << "    press 'q' or close window to QUIT" << std::endl;
+    std::cout << "  Every 3 frames -> save 1 frame" << std::endl;
+    std::cout << "  Output dir: /home/h/output/" << std::endl;
+    std::cout << "======================================" << std::endl;
+
+    while (ros::ok() && !g_quit_from_gui.load())
+    {
+        // 1. 处理键盘输入 (非阻塞)
+        int key = nb_getchar();
+        while (key != -1)
+        {
+            if (key == 'i' || key == 'I')
+            {
+                rec.active = true;
+                rec.frame_cnt = 0;
+                std::cout << "\n>>> [RECORD START] frame_cnt reset, save_cnt="
+                          << rec.save_cnt << std::endl;
+            }
+            else if (key == 'o' || key == 'O')
+            {
+                rec.active = false;
+                std::cout << "\n>>> [RECORD STOP] total saved="
+                          << rec.save_cnt << std::endl;
+            }
+            else if (key == 'q' || key == 'Q')
+            {
+                std::cout << "\n>>> [QUIT from keyboard]" << std::endl;
+                goto cleanup;
+            }
+            key = nb_getchar();
+        }
+
+        // 2. 读取相机帧
+        cv::Mat frame = camera.camera_read();
+        if (frame.empty())
+        {
+            std::cout << "frame.empty()" << std::endl;
+            ros::Duration(0.01).sleep();
             continue;
         }
 
-        // 参数（每个 bag 独立创建）
-        rs2_intrinsics color_intr = createManualIntrinsics();
-        Ten::kfs_locator::Ten_set_result plane_fiter(color_intr);
-        Ten::XYZRPY bias;
-        Ten::kfs_locator::Ten_debug_pcl debug_pcl;
+        // 3. 实时检测 (始终运行, 不受录制状态影响)
+        bool detected = Apriltag_d.detect(frame);
 
-        // 每个 bag 独立的输出目录
-        const std::string bag_output_dir = output_root + bag_label + "/";
-        // 用 mkdir 创建目录（不存在则创建）
-        if (system(("mkdir -p " + bag_output_dir).c_str()) != 0) {
-            ROS_WARN("Failed to create directory: %s", bag_output_dir.c_str());
+        // 终端打印检测状态 (仅状态变化时打印, 避免刷屏)
+        {
+            static bool last_detected = false;
+            if (detected != last_detected)
+            {
+                if (detected)
+                    std::cout << "[DETECT] found " << Apriltag_d.detections().size()
+                              << " tag(s)" << std::endl;
+                else
+                    std::cout << "[DETECT] no tag" << std::endl;
+                last_detected = detected;
+            }
         }
 
-        const std::string path_x     = bag_output_dir + "x.txt";
-        const std::string path_y     = bag_output_dir + "y.txt";
-        const std::string path_z     = bag_output_dir + "z.txt";
-        const std::string path_angle = bag_output_dir + "angle.txt";
-
-        // 清空旧文件
-        for (const auto* p : {&path_x, &path_y, &path_z, &path_angle})
-            std::ofstream(*p, std::ios::trunc).close();
-
-        // 预计算 bag 中有效帧对数量
-        int bag_frame_pairs = 0;
-        for (auto it = g_view->begin(); it != g_view->end(); ++it)
-            if (it->getTopic() == "/bgr_image") ++bag_frame_pairs;
-
-        g_msg_iter = g_view->begin();
-
-        int total_frames   = 0;
-        int success_frames = 0;
-
-        // ── 逐帧处理 ──
-        while (ros::ok() && total_frames < bag_frame_pairs)
+        // 4. 仅在录制状态下保存
+        if (rec.active)
         {
-            Ten::camera_frame frame = get_next_frame_from_bag();
-            ++total_frames;
+            rec.frame_cnt++;
 
-            bool is_pre_ok = plane_fiter.preprocess(frame);
-            if (is_pre_ok)
+            if (rec.frame_cnt % 3 == 0)
             {
-                bool is_post_ok = plane_fiter.postprocess();
-                if (is_post_ok)
-                {
-                    Ten::kfs_locator::result result = plane_fiter.set_result(bias);
-                    ++success_frames;
+                std::ostringstream oss;
+                oss << std::setw(6) << std::setfill('0') << rec.save_cnt;
+                std::string idx_str = oss.str();
 
-                    debug_pcl.save_bias(result.x,          path_x);
-                    debug_pcl.save_bias(result.y,          path_y);
-                    debug_pcl.save_bias(result.z,          path_z);
-                    debug_pcl.save_bias(result.bia_radian * 180.0 / M_PI, path_angle);
-                    debug_pcl.pub_color_image(frame.bgr_image);
+                std::string img_name = idx_str + ".jpg";
+                std::string img_path = rec.images_dir + "/" + img_name;
+
+                cv::imwrite(img_path, frame);
+                std::cout << "[SAVE] " << img_name << "  detected="
+                          << (detected ? "YES" : "NO");
+
+                if (detected)
+                {
+                    const auto& detections = Apriltag_d.detections();
+                    std::string json_path = rec.labels_dir + "/" + idx_str + ".json";
+                    saveYoloJson(json_path, img_name,
+                                 frame.cols, frame.rows, detections);
+                    std::cout << "  tags=" << detections.size()
+                              << "  json=" << idx_str << ".json";
                 }
+
+                std::cout << std::endl;
+                rec.save_cnt++;
             }
 
-            ros::spinOnce();
+            if (rec.frame_cnt % 30 == 0)
+            {
+                std::cout << "[REC] frame=" << rec.frame_cnt
+                          << "  saved=" << rec.save_cnt << std::endl;
+            }
         }
 
-        // 关闭当前 bag
-        g_bag.close();
-        delete g_view;
-        g_view = nullptr;
+        // 5. 更新显示帧 (线程安全)
+        {
+            std::lock_guard<std::mutex> lock(g_disp_mutex);
+            frame.copyTo(g_disp_frame.image);
+            g_disp_frame.detected  = detected;
+            g_disp_frame.tags      = Apriltag_d.detections();
+            g_disp_frame.recording = rec.active;
+            g_disp_frame.frame_cnt = rec.frame_cnt;
+            g_disp_frame.save_cnt  = rec.save_cnt;
+        }
 
-        // ── 打印并写入统计 ──
-        double success_rate = (total_frames > 0)
-            ? 100.0 * success_frames / total_frames
-            : 0.0;
-
-        // 控制台输出
-        std::cout << "\n=========================================" << std::endl;
-        std::cout << "   [" << bag_label << "] 静态跳变统计结果" << std::endl;
-        std::cout << "=========================================" << std::endl;
-        std::cout << "总帧数: " << total_frames
-                  << " | 成功帧数: " << success_frames
-                  << " | 成功率: " << std::fixed << std::setprecision(1)
-                  << success_rate << "%" << std::endl;
-        std::cout << "=========================================" << std::endl;
-
-        // 汇总文件输出
-        summary_file << "────────────────────────────────────────────────\n";
-        summary_file << "  Bag: " << bag_label << "\n";
-        summary_file << "  路径: " << bag_path << "\n";
-        summary_file << "  总帧数: " << total_frames
-                     << " | 成功帧数: " << success_frames
-                     << " | 成功率: " << success_rate << "%\n";
-
-        // 通用打印 lambda（控制台 + 文件双写）
-        auto print_stats = [&](const std::string& label, const std::string& path) {
-            auto s = debug_pcl.read_bias(path);
-
-            // 控制台
-            std::cout << "\n── " << label << " ──" << std::endl;
-            std::cout << std::fixed << std::setprecision(4);
-            std::cout << "  平均值 (avg):       " << s["avg"] << std::endl;
-            std::cout << "  标准差 (std):       " << s["standard_bias"] << std::endl;
-            std::cout << "  跳变幅度 (Δ):       " << s["delta"] << std::endl;
-            std::cout << "  90%范围 (P95-P5):   " << s["90%_range"] << std::endl;
-            std::cout << "  最大值 (max):       " << s["max"] << std::endl;
-            std::cout << "  最小值 (min):       " << s["min"] << std::endl;
-
-            // 文件
-            summary_file << "\n  " << label << ":\n";
-            summary_file << "    平均值 (avg):       " << s["avg"] << "\n";
-            summary_file << "    标准差 (std):       " << s["standard_bias"] << "\n";
-            summary_file << "    跳变幅度 (Δ):       " << s["delta"] << "\n";
-            summary_file << "    90%范围 (P95-P5):   " << s["90%_range"] << "\n";
-            summary_file << "    最大值 (max):       " << s["max"] << "\n";
-            summary_file << "    最小值 (min):       " << s["min"] << "\n";
-        };
-
-        print_stats("X (m)",        path_x);
-        print_stats("Y (m)",        path_y);
-        print_stats("Z (m)",        path_z);
-        print_stats("Angle (deg)",  path_angle);
-
-        std::cout << "\n=========================================" << std::endl;
-        summary_file << "\n";
+        // 6. 让 ROS 处理回调
+        ros::spinOnce();
     }
 
-    // ── 4. 收尾 ──
-    summary_file << "================================================\n";
-    summary_file << "           处理完成（共 " << bag_list.size() << " 个 bag）\n";
-    summary_file << "================================================\n";
-    summary_file.close();
+cleanup:
+    // 通知显示线程退出
+    g_disp_running.store(false);
+    restoreInput();
 
-    std::cout << "\n✅ 汇总统计已保存至: " << summary_path << std::endl;
-    cv::destroyAllWindows();
+    if (disp_thread.joinable())
+        disp_thread.join();
+
+    std::cout << "Exited. Total saved frames: " << rec.save_cnt << std::endl;
 }
 
 int main(int argc, char** argv)
 {
-    // 初始化ROS节点--------------------------------------------------------------
     ros::init(argc, argv, "test_node");
-
-    // if (argc < 2)
-    // {
-    //     std::cerr << "用法: test_node <bag_path>" << std::endl;
-    //     return 1;
-    // }
-    
-    test1_fromframe();
-    
-    delete g_view;
-    g_bag.close();
+    ros::NodeHandle nh;
+    test();
     return 0;
 }

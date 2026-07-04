@@ -94,8 +94,12 @@ rosrun camera test_thread_node
 - **优化** `kfs_locator` 各模块: 识别 35cm 方块 (kfs) 完整位姿
 - **优化** 多线程处理管线 (test_thread.cpp / threadpool.h)
 
-### camera_ws2.51 — Apriltag 识别版
-- 引入 apriltag 库（`find_package(apriltag REQUIRED)`）
-- 在 R1 机器人上固定 apriltag 标识，通过识别 apriltag 定位 R1
-- 移除多线程节点和 OpenVINO 依赖
-- 简化管线，专注 apriltag 定位
+### camera_ws2.51 — Apriltag R1 识别版
+- **新增** `apriltag_detect/`: Apriltag 检测模块，在 R1 机器人上固定 apriltag 标识
+- **新增** `apriltag_detector.h`: Apriltag 检测器封装
+- **新增** `README_APRILTAG.md`: Apriltag 使用文档
+- **新增** CMakeLists.txt 中 `find_package(apriltag REQUIRED)` 依赖
+- **移除** `kfs_locator/`: 移除 KFS 方块定位模块
+- **移除** `test_thread.cpp` / `threadpool.cpp/h`: 移除多线程架构
+- **移除** `learn/`: 移除学习文档
+- 专注 apriltag 识别 R1 机器人位姿，简化处理管线

@@ -46,6 +46,7 @@ find_package(OpenVINO REQUIRED)
 
 
 find_package(realsense2)
+find_package(apriltag REQUIRED)
 ## System dependencies are found with CMake's conventions
 # find_package(Boost REQUIRED COMPONENTS system)
 
@@ -155,6 +156,7 @@ include_directories(
   ${catkin_INCLUDE_DIRS}
   ${realsense2_INCLUDE_DIR}
   ${OpenCV_INCLUDE_DIRS}
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 ## Declare a C++ library
@@ -174,9 +176,6 @@ add_executable(test_node
 src/test.cpp
 )
 
-add_executable(test_thread_node 
-src/test_thread.cpp
-)
 ## Rename C++ executable without prefix
 ## The above recommended prefix causes long target names, the following renames the
 ## target back to the shorter version for ease of user use
@@ -202,24 +201,9 @@ target_link_libraries(test_node
   openvino::runtime
   ${realsense2_INCLUDE_DIR}
   /usr/lib/x86_64-linux-gnu/librealsense2.so
+  apriltag::apriltag
 )
 
-
-target_sources(test_thread_node
-  PRIVATE
-  src/camera.cpp
-  src/method_math.cpp
-  src/yolo/yolo_base.cpp
-  src/threadpool.cpp
-)
-
-
-target_link_libraries(test_thread_node
-  ${catkin_LIBRARIES}
-  openvino::runtime
-  ${realsense2_INCLUDE_DIR}
-  /usr/lib/x86_64-linux-gnu/librealsense2.so
-)
 #############
 ## Install ##
 #############
