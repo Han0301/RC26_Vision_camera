@@ -8,6 +8,7 @@
 #include <pcl/point_cloud.h>
 #include "pnp_func.h"
 #include "../camera.h"
+#include <sensor_msgs/PointCloud2.h>
 
 namespace Ten
 {
@@ -29,7 +30,11 @@ struct DebugConfig
 class DebugDrawer
 {
 public:
-    DebugDrawer() = default;
+    DebugDrawer()
+    {
+        pcl_pub_ = nh.advertise<sensor_msgs::PointCloud2>(topic_name, 10);
+        pnp_debug_img_pub = nh.advertise<sensor_msgs::Image>("/kfs/debug_image", 10);
+    };
 
     // 👇 所有函数直接在类内实现，自动内联，无多重定义
     void init()
@@ -37,6 +42,21 @@ public:
         if (!config_.enable_debug_window) return;
         cv::namedWindow(config_.window_name, cv::WINDOW_NORMAL);
         cv::resizeWindow(config_.window_name, config_.win_width, config_.win_height);
+    }
+
+    void publish_pointcloud(
+        const pcl::PointCloud<pcl::PointXYZ>::Ptr& pcl_cloud,
+        std::string frame_id = "map"
+    )
+    {
+        if (!pcl_pub_ || pcl_cloud->empty()) return;
+
+        // 转ROS消息并发布
+        sensor_msgs::PointCloud2 ros_cloud;
+        pcl::toROSMsg(*pcl_cloud, ros_cloud);
+        ros_cloud.header.frame_id = frame_id;
+        ros_cloud.header.stamp = ros::Time::now();
+        pcl_pub_.publish(ros_cloud);
     }
 
     void shutdown()
@@ -74,7 +94,61 @@ public:
         }
     }
 
+    void publishPnpDebugImage(
+        const cv::Mat& color,
+        const kfsPnpOutput& pnp_out,
+        const rs2_intrinsics& color_intr
+    )
+    {
+        // 空图像直接返回
+        if (color.empty())
+            return;
+
+        // —————————— 1:1 复刻原 draw 函数的图像处理逻辑 ——————————
+        cv::Mat img = color.clone();
+        try
+        {
+            if (!pnp_out.valid)
+            {
+                cv::putText(img, "STATUS: DETECTING...", cv::Point(20, 40),
+                    cv::FONT_HERSHEY_SIMPLEX, config_.font_scale,
+                    cv::Scalar(0, 0, 255), config_.line_thickness);
+            }
+            else
+            {
+                cv::rectangle(img, pnp_out.roi, cv::Scalar(0, 255, 255), config_.line_thickness);
+                drawAllPlanes(img, pnp_out.planeClouds, color_intr);  // 原有绘制函数
+                drawPoseAxis(img, pnp_out, color_intr);              // 原有绘制函数
+
+                char buf[256];
+                snprintf(buf, sizeof(buf), "X:%.2f Y:%.2f Z:%.2f",
+                    pnp_out.center.x(), pnp_out.center.y(), pnp_out.center.z());
+                cv::putText(img, buf, cv::Point(20, 80),
+                    cv::FONT_HERSHEY_SIMPLEX, config_.font_scale,
+                    cv::Scalar(0, 255, 0), config_.line_thickness);
+            }
+        }
+        catch (...)
+        {
+            // 异常不崩溃
+        }
+
+        // —————————— 发布处理后的图像到ROS话题 ——————————
+        cv_bridge::CvImage cv_msg;
+        cv_msg.header.stamp = ros::Time::now();
+        cv_msg.encoding = sensor_msgs::image_encodings::BGR8;
+        cv_msg.image = img;
+
+        sensor_msgs::ImagePtr msg = cv_msg.toImageMsg();
+        pnp_debug_img_pub.publish(msg);
+    }
+
 private:
+    ros::Publisher pcl_pub_;
+    ros::Publisher pnp_debug_img_pub;
+    ros::NodeHandle nh;
+    std::string topic_name = "/camera/pointcloud";
+
     void drawAllPlanes(cv::Mat& img, const std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& planes, const rs2_intrinsics& intr)
     {
         const cv::Scalar colors[] = {cv::Scalar(255,0,255), cv::Scalar(0,255,0), cv::Scalar(255,255,0)};

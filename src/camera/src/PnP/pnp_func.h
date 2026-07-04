@@ -19,9 +19,12 @@
 #include <pcl/filters/voxel_grid.h>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <pcl/segmentation/extract_clusters.h>
 #include <pcl/segmentation/sac_segmentation.h>
 #include <pcl/registration/icp.h>
 #include "pnp_param.h"
+#include "../camera.h"
+#include "../openvino.h"
 
 namespace Ten
 {
@@ -33,8 +36,9 @@ struct kfsPnpOutput
 {
   bool valid = false;                                   // 结果有效标志，true为有效
   std::string status;                                   // 状态信息，记录处理结果
+
   cv::Rect roi;                                          // 目标ROI矩形区域
-  cv::Mat redMask;                                      // 红色目标掩码图像
+  cv::Mat kfs_Mask;                                      // 目标掩码图像
 
   Eigen::Vector3f center = Eigen::Vector3f::Zero();      // 目标中心坐标
   Eigen::Quaternionf orientation = Eigen::Quaternionf::Identity();  // 目标旋转四元数
@@ -45,26 +49,36 @@ struct kfsPnpOutput
   std::vector<pcl::ModelCoefficients::Ptr> planeCoeffs; // 平面模型系数集合
 
   // 构造函数，初始化点云智能指针
-  inline kfsPnpOutput()
+  kfsPnpOutput()
       : cloudRaw(new pcl::PointCloud<pcl::PointXYZ>),
         cloudFiltered(new pcl::PointCloud<pcl::PointXYZ>)
   {
   }
 };
 
+// 平面数据结构体
+struct planeData
+{
+  Eigen::Vector3f normal;
+  Eigen::Vector3f bodyCenter;
+  int pointsCount;
+  size_t cloudIdx;
+  float faceArea;
+};
 
 // PnP位姿求解器类，实现完整位姿解算流程
 class kfsPnpSolver
 {
 public:
-  /*
-   * @brief 构造函数，初始化求解器
-   * @param cfg 算法配置参数
-   * @param color_intr 相机内参
-   * @return 无
-   */
+  // 构造函数
   explicit kfsPnpSolver(const kfsPnpConfig& cfg, const rs2_intrinsics& color_intr)
-      : cfg_(cfg)
+      : cfg_(cfg),
+        color_intr_(color_intr),
+        inliers(new pcl::PointIndices),
+        coeff(new pcl::ModelCoefficients),
+        plane(new pcl::PointCloud<pcl::PointXYZ>),
+        remain(new pcl::PointCloud<pcl::PointXYZ>),
+        detector("/home/h/下载/卷轴检测_han2/best","cpu",0,0.5,0.5)
   {
     // 覆盖相机内参参数
     cfg_.fx = color_intr.fx;
@@ -73,11 +87,7 @@ public:
     cfg_.cy = color_intr.ppy;
   }
 
-  /*
-   * @brief 获取算法配置参数
-   * @return 配置参数常量引用
-   */
-  inline const kfsPnpConfig& config() const
+  const kfsPnpConfig& config() const
   {
     return cfg_;
   }
@@ -88,20 +98,25 @@ public:
    * @param depthU16 输入深度图像
    * @return 解算结果结构体
    */
-  inline kfsPnpOutput process(const cv::Mat& colorBgr, const cv::Mat& depthU16)
+  kfsPnpOutput process(
+    const cv::Mat& colorBgr, 
+    const cv::Mat& depth_frame
+)
   {
     // 初始化输出对象
     kfsPnpOutput out;
 
-    // 判断输入图像是否为空
-    if (colorBgr.empty() || depthU16.empty())
+    // 判断输入图像是否为空 || 验证智能指针本身非空 || 验证 RealSense 深度帧对象有效
+    if (colorBgr.empty() || depth_frame.empty() )
     {
-      out.status = "empty color/depth frame";
+      out.status = "colorBgr.empty() || depth_frame.empty()";
       return out;
     }
 
     // 提取红色目标ROI区域
-    out.roi = getRedRoi(colorBgr, out.redMask);
+    out.roi = getRedRoi(colorBgr, out.kfs_Mask);
+
+    // out.roi = test_yolo2(colorBgr);
 
     // 判断ROI是否有效
     if (out.roi.area() <= 0)
@@ -109,19 +124,24 @@ public:
       out.status = "no red roi";
       return out;
     }
-
+    
     // ROI区域转换为三维点云
-    convertRoiToCloud(depthU16, out.roi, out.redMask, out.cloudRaw, 2);
+    convertRoiToCloud(depth_frame, out.roi, out.kfs_Mask, out.cloudRaw);
 
     // 判断原始点云是否为空
-    if (out.cloudRaw->empty())
+    if (out.cloudRaw->empty() || out.cloudRaw->size() > 80000)
     {
-      out.status = "empty roi cloud";
+      out.status = "out.cloudRaw->empty() || out.cloudRaw->size() > 80000";
       return out;
     }
 
-    // 点云预处理（滤波+降采样）
-    out.cloudFiltered = preprocessCloud(out.cloudRaw);
+    // set_Pcl_Cloud(depth_frame,color_intr_,out.cloudRaw);
+    std::cout << "out.cloudRaw.size(): " << out.cloudRaw->size() << std::endl;
+
+    // 点云预处理（降采样 + 欧式聚类）
+    voxel_Downsample(out.cloudRaw, out.cloudFiltered);
+    euclidean_filter(out.cloudFiltered,out.cloudFiltered);
+    std::cout << "out.cloudFiltered.size(): " << out.cloudFiltered->size() << std::endl;
 
     // 判断滤波后点云是否为空
     if (!out.cloudFiltered || out.cloudFiltered->empty())
@@ -136,12 +156,21 @@ public:
     // 判断平面提取是否成功
     if (out.planeCoeffs.empty())
     {
-      out.status = "plane fit failed";
+      out.status = "plane extract failed";
       return out;
     }
 
     // 平面解算目标位姿
-    solvePoseFromPlanes(out.planeCoeffs, out.planeClouds, &out.center, &out.orientation);
+    bool plane_ok = plane_filter(out.planeCoeffs, out.planeClouds, plane_info);
+    if (plane_ok)
+    {
+      solvePoseFromPlanes(out.planeCoeffs, out.planeClouds, plane_info, &out.center, &out.orientation);
+    }
+    else
+    {
+      out.status = "plane filter failed";
+      return out;
+    }
 
     // 位姿初始化完成后执行ICP精配准
     if (poseInitialized_)
@@ -169,7 +198,7 @@ public:
   }
 
   // 设置roi接口
-  inline void set_roi(const cv::Rect& roi, kfsPnpOutput& out)
+  void set_roi(const cv::Rect& roi, kfsPnpOutput& out)
   {
     if (roi.area() <= 0)
     {
@@ -180,19 +209,147 @@ public:
   }
 
 private:
+
+  cv::Rect test_yolo2(const cv::Mat &img)
+  {
+      // 调用worker函数
+      cv::Mat image = img.clone();
+      std::vector<Ten::Detection> results = detector.worker(image);
+
+      if(results.size() == 0)
+      {
+        return cv::Rect();
+      }
+
+      // 遍历框，计算其中面积最大的
+      // Ten::Detection best;
+      // double max_square = 0;
+      // for (int i = 0; i < results.size(); i++)
+      // {
+      //     double square = results[i].w_ * results[i].h_;
+      //     if (square > max_square)
+      //     {
+      //         best = results[i];
+      //         max_square = square;
+      //     }
+      // }
+      std::sort(results.begin(), results.end(),
+                [](const Ten::Detection &det1, const Ten::Detection &det2) -> bool
+                {
+                    double s1 = det1.w_ * det1.h_;
+                    double s2 = det2.w_ * det2.h_;
+                    return s1 > s2;
+                });
+      Ten::Detection best = results[0];
+
+      // 归一化
+      float x1 = best.cx_ - best.w_ / 2;
+      float x2 = best.cx_ + best.w_ / 2;
+      float y1 = best.cy_ - best.h_ / 2;
+      float y2 = best.cy_ + best.h_ / 2;
+
+      return cv::Rect(cv::Point2i(x1, y1), cv::Point2i(x2, y2));
+  }
+
+  cv::Rect getRedRoi_(const cv::Mat& src, cv::Mat& outMask) const
+  {
+      // ====================== 修改部分：替换为HSV颜色空间 ======================
+      cv::Mat hsv;
+      // BGR转HSV（OpenCV默认图像格式为BGR，必须用这个转换）
+      cv::cvtColor(src, hsv, cv::COLOR_BGR2HSV);
+
+      // 红色在HSV中分为两个区间，定义通用红色阈值（适配绝大多数场景）
+      cv::Scalar lower_red1 = cv::Scalar(0, 120, 70);    // 红色下段 H:0-10
+      cv::Scalar upper_red1 = cv::Scalar(10, 255, 255);
+      cv::Scalar lower_red2 = cv::Scalar(160, 120, 70);  // 红色上段 H:160-179
+      cv::Scalar upper_red2 = cv::Scalar(179, 255, 255);
+
+      cv::Scalar lower_blue = cv::Scalar(80, 150, 50);  // 红色上段 H:160-179
+      cv::Scalar upper_blue = cv::Scalar(120, 255, 255);
+      // 生成两个红色掩码
+      cv::Mat mask1, mask2;
+      cv::inRange(hsv, lower_red1, upper_red1, mask1);
+      cv::inRange(hsv, lower_red2, upper_red2, mask2);
+
+      cv::Mat mask;
+      cv::inRange(hsv,lower_blue,upper_blue,mask);
+      // 合并两个掩码，得到最终红色区域掩码
+      cv::bitwise_or(mask1, mask2, outMask);
+      // ======================================================================
+
+      // 创建形态学卷积核（保留你原代码不变）
+      cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
+
+      // 开运算去除噪点（保留原代码）
+      cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel);
+
+      // 闭运算填充空洞（保留原代码）
+      cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel);
+
+      // 提取图像轮廓（保留原代码）
+      std::vector<std::vector<cv::Point>> contours;
+      cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+      // 判断轮廓是否为空（保留原代码）
+      if (contours.empty())
+      {
+          return cv::Rect();
+      }
+
+      // 计算图像最大允许面积（保留原代码）
+      const double imageArea = static_cast<double>(src.cols * src.rows);
+      const double maxAllowedArea = cfg_.roiMaxAreaRatio * imageArea;
+
+      // 遍历轮廓筛选最优目标（保留原代码）
+      double bestArea = 0.0;
+      int bestIdx = -1;
+      for (size_t i = 0; i < contours.size(); ++i)
+      {
+          const double area = cv::contourArea(contours[i]);
+          if (area < cfg_.roiMinArea || area > maxAllowedArea)
+          {
+              continue;
+          }
+          if (area > bestArea)
+          {
+              bestArea = area;
+              bestIdx = static_cast<int>(i);
+          }
+      }
+
+      // 判断是否找到有效轮廓（保留原代码）
+      if (bestIdx < 0)
+      {
+          return cv::Rect();
+      }
+
+      // 计算最优轮廓外接矩形并扩展（保留原代码）
+      cv::Rect rect = cv::boundingRect(contours[static_cast<size_t>(bestIdx)]);
+      rect.x = std::max(0, rect.x);
+      rect.y = std::max(0, rect.y);
+      rect.width = std::min(src.cols - rect.x, rect.width);
+      rect.height = std::min(src.rows - rect.y, rect.height);
+      return rect;
+  }
+
+
   // 提取红色目标ROI区域
-  inline cv::Rect getRedRoi(const cv::Mat& src, cv::Mat& outMask) const
+  cv::Rect getRedRoi(const cv::Mat& src, cv::Mat& outMask) const
   {
     // 图像转换为LAB颜色空间
     cv::Mat lab;
     cv::cvtColor(src, lab, cv::COLOR_BGR2Lab);
 
     // 颜色阈值提取红色区域
-    cv::inRange(lab,
-                cv::Scalar(cfg_.labLMin, cfg_.labAMin, cfg_.labBMin),
-                cv::Scalar(cfg_.labLMax, cfg_.labAMax, cfg_.labBMax),
-                outMask);
+    // cv::inRange(lab,
+    //             cv::Scalar(cfg_.red.labLMin, cfg_.red.labAMin, cfg_.red.labBMin),
+    //             cv::Scalar(cfg_.red.labLMax, cfg_.red.labAMax, cfg_.red.labBMax),
+    //             outMask);
 
+    cv::inRange(lab,
+                cv::Scalar(cfg_.blue.labLMin, cfg_.blue.labAMin, cfg_.blue.labBMin),
+                cv::Scalar(cfg_.blue.labLMax, cfg_.blue.labAMax, cfg_.blue.labBMax),
+                outMask);
     // 创建形态学卷积核
     cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(5, 5));
 
@@ -201,6 +358,17 @@ private:
 
     // 闭运算填充空洞
     cv::morphologyEx(outMask, outMask, cv::MORPH_CLOSE, kernel);
+
+    // // 计算图像中心点坐标
+    // int cx = src.cols / 2;
+    // int cy = src.rows / 2;
+
+    // // 获取中心点的 Lab 像素值 (OpenCV 中 Lab 存储为 0~255)
+    // cv::Vec3b center_lab = lab.at<cv::Vec3b>(cy, cx);
+    // int L = center_lab[0];  // L通道
+    // int a = center_lab[1];  // a通道
+    // int b = center_lab[2];  // b通道
+    // std::cout << "L: " << L << ",a: " << a << ",b: " << b << std::endl;
 
     // 提取图像轮廓
     std::vector<std::vector<cv::Point>> contours;
@@ -241,130 +409,146 @@ private:
 
     // 计算最优轮廓外接矩形并扩展
     cv::Rect rect = cv::boundingRect(contours[static_cast<size_t>(bestIdx)]);
-    rect.x = std::max(0, rect.x - cfg_.roiPadding);
-    rect.y = std::max(0, rect.y - cfg_.roiPadding);
-    rect.width = std::min(src.cols - rect.x, rect.width + 2 * cfg_.roiPadding);
-    rect.height = std::min(src.rows - rect.y, rect.height + 2 * cfg_.roiPadding);
+    rect.x = std::max(0, rect.x);
+    rect.y = std::max(0, rect.y);
+    rect.width = std::min(src.cols - rect.x, rect.width);
+    rect.height = std::min(src.rows - rect.y, rect.height);
     return rect;
   }
 
   // ROI区域转换为三维点云
-  inline void convertRoiToCloud(const cv::Mat& depth,
+  void convertRoiToCloud(const cv::Mat& depth_frame,
                                 const cv::Rect& roi,
-                                const cv::Mat& mask,
-                                pcl::PointCloud<pcl::PointXYZ>::Ptr cloud,
-                                int step = 2) const
+                                const cv::Mat& target_mask,
+                                pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) const
   {
     // 清空并预分配点云内存
     cloud->clear();
-    cloud->reserve(static_cast<size_t>((roi.width / step) * (roi.height / step)));
-
-    // 深度值缩放系数，毫米转米
-    constexpr double kDepthScale = 0.001;
+    int w = depth_frame.cols;
+    int h = depth_frame.rows;
 
     // 遍历ROI区域像素
-    for (int v = roi.y; v < roi.y + roi.height; v += step)
+    const int start_v = std::max(0, roi.y - cfg_.roi_padding);
+    const int end_v   = std::min(h, roi.y + roi.height + cfg_.roi_padding);
+    const int start_u = std::max(0, roi.x - cfg_.roi_padding);
+    const int end_u   = std::min(w, roi.x + roi.width + cfg_.roi_padding);
+
+    for (int v = start_v; v < end_v; v++)
     {
-      for (int u = roi.x; u < roi.x + roi.width; u += step)
+      for (int u = start_u; u < end_u; u++)
       {
-        // 跳过非红色区域
-        if (mask.at<uint8_t>(v, u) == 0)
-        {
-          continue;
-        }
+        // 跳过非方块区域
+        // if (target_mask.at<uint8_t>(v, u) == 0) continue;
 
         // 获取深度值
-        uint16_t d = depth.at<uint16_t>(v, u);
-        if (d == 0)
-        {
-          continue;
-        }
+        float z = depth_frame.ptr<uint16_t>(v)[u] * 0.001f;
+        int z_mm = int(z * 1000);
 
-        // 3x3邻域深度平滑滤波
-        int validCount = 0;
-        unsigned int dSum = 0;
-        for (int dv = -1; dv <= 1; ++dv)
-        {
-          for (int du = -1; du <= 1; ++du)
-          {
-            const int nv = v + dv;
-            const int nu = u + du;
-            if (nv < roi.y || nv >= roi.y + roi.height || nu < roi.x || nu >= roi.x + roi.width)
-            {
-              continue;
-            }
-            const uint16_t dNei = depth.at<uint16_t>(nv, nu);
-            if (dNei > 0 && std::abs(static_cast<int>(dNei) - static_cast<int>(d)) < 50)
-            {
-              dSum += dNei;
-              ++validCount;
-            }
-          }
-        }
+        // 过滤无效深度
+        if (z <= 0 || z_mm < cfg_.CloudDepth_min || z_mm > cfg_.CloudDepth_max)
+            continue;
 
-        // 过滤有效点数不足的像素
-        if (validCount < 4)
-        {
-          continue;
-        }
-        d = static_cast<uint16_t>(dSum / static_cast<unsigned int>(validCount));
-
-        // 深度值单位转换
-        const float z = static_cast<float>(d * kDepthScale);
-        if (z < cfg_.passZMin || z > cfg_.passZMax)
-        {
-          continue;
-        }
-
-        // 像素坐标转换为相机坐标系3D点
+        // 反投影
+        float pixel[2] = {(float)u, (float)v};
+        float point3d[3] = {0};
+        rs2_deproject_pixel_to_point(point3d, &color_intr_, pixel, z);
+        
         pcl::PointXYZ p;
-        p.z = z;
-        p.x = static_cast<float>((u - cfg_.cx) * z / cfg_.fx);
-        p.y = static_cast<float>((v - cfg_.cy) * z / cfg_.fy);
+        p.x = point3d[0];
+        p.y = point3d[1];
+        p.z = point3d[2];
         cloud->push_back(p);
       }
     }
-
-    // 设置点云属性
-    cloud->width = static_cast<uint32_t>(cloud->size());
-    cloud->height = 1;
-    cloud->is_dense = false;
   }
 
-  // 点云预处理：滤波+降采样
-  inline pcl::PointCloud<pcl::PointXYZ>::Ptr preprocessCloud(
-      const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloudIn) const
+  /**
+   * @brief 根据深度图像， 内参， 直接转成pcl点云
+   * @param depth_frame       原生深度帧
+   * @param color_intr        彩色相机内参
+   * @param pcl_cloud         输出的pcl_cloud点云
+  */
+  void set_Pcl_Cloud(
+    const cv::Mat& depth_frame,
+    const rs2_intrinsics& color_intr,
+    pcl::PointCloud<pcl::PointXYZ>::Ptr& pcl_cloud
+  )
   {
-    // 初始化中间点云对象
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloudPass(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloudOut(new pcl::PointCloud<pcl::PointXYZ>);
+    pcl_cloud->clear();
+    int w = depth_frame.cols;
+    int h = depth_frame.rows;
 
-    // Z轴直通滤波
-    pcl::PassThrough<pcl::PointXYZ> pass;
-    pass.setInputCloud(cloudIn);
-    pass.setFilterFieldName("z");
-    pass.setFilterLimits(cfg_.passZMin, cfg_.passZMax);
-    pass.filter(*cloudPass);
+    for (int v = 0; v < h; v++) {
+      for (int u = 0; u < w; u++) {
+        // 原生精准深度（0.1mm精度，斜视角无误差）
+        float z = depth_frame.ptr<uint16_t>(v)[u] * 0.001f;
+        int z_mm = int(z * 1000);
 
-    // 判断滤波后点云是否为空
-    if (cloudPass->empty())
-    {
-      return cloudOut;
+        // 过滤无效深度
+        if (z <= 0 || z_mm < cfg_.CloudDepth_min || z_mm > cfg_.CloudDepth_max)
+          continue;
+
+        // 反投影（align后用彩色内参，坐标系100%对齐）
+        float pixel[2] = {(float)u, (float)v};
+        float point3d[3] = {0};
+        rs2_deproject_pixel_to_point(point3d, &color_intr, pixel, z);
+        
+        pcl::PointXYZ p;
+        p.x = point3d[0];
+        p.y = point3d[1];
+        p.z = point3d[2];
+        pcl_cloud->push_back(p);
+        }
     }
-
-    // 体素网格降采样
-    pcl::VoxelGrid<pcl::PointXYZ> vg;
-    vg.setInputCloud(cloudPass);
-    vg.setLeafSize(cfg_.voxelLeaf, cfg_.voxelLeaf, cfg_.voxelLeaf);
-    vg.filter(*cloudOut);
-    return cloudOut;
   }
 
-  // 多平面特征提取
-  inline void extractMultiPlanes(
+  // 点云预处理: 降采样
+  void voxel_Downsample(
+      const pcl::PointCloud<pcl::PointXYZ>::Ptr& input_cloud,
+      pcl::PointCloud<pcl::PointXYZ>::Ptr& output_cloud
+  )
+  {
+      // 判断点云是否为空
+      if (input_cloud->empty())
+      {
+          return;
+      }
+
+      // 初始化并配置体素滤波器
+      pcl::VoxelGrid<pcl::PointXYZ> vg;
+      vg.setInputCloud(input_cloud);
+      vg.setLeafSize(cfg_.voxelLeaf, cfg_.voxelLeaf, cfg_.voxelLeaf);
+      vg.filter(*output_cloud);
+  }
+
+  void euclidean_filter(
+      const pcl::PointCloud<pcl::PointXYZ>::Ptr& input_cloud,
+      pcl::PointCloud<pcl::PointXYZ>::Ptr& output_cloud)
+  {
+      // 执行欧式聚类
+      std::vector<pcl::PointIndices> cluster_indices;
+      pcl::EuclideanClusterExtraction<pcl::PointXYZ> ec;
+      ec.setInputCloud(input_cloud);
+      ec.setClusterTolerance(cfg_.ClusterTolerance);
+      ec.extract(cluster_indices);
+
+      // 提取主聚类点云
+      if (cluster_indices.empty())
+      {
+          *output_cloud = *input_cloud;
+          return;
+      }
+      output_cloud->clear();
+      for (int idx : cluster_indices[0].indices)
+      {
+          output_cloud->push_back(input_cloud->points[idx]);
+      }
+  }
+
+  void extractMultiPlanes(
       const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloudIn,
       std::vector<pcl::ModelCoefficients::Ptr>* planeCoeffs,
-      std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>* planeClouds) const
+      std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>* planeClouds)
   {
     // 清空输出容器
     planeCoeffs->clear();
@@ -390,9 +574,8 @@ private:
         break;
       }
 
-      // 初始化平面系数和内点索引
-      pcl::ModelCoefficients::Ptr coeff(new pcl::ModelCoefficients);
-      pcl::PointIndices::Ptr inliers(new pcl::PointIndices);
+      inliers->indices.clear();
+      coeff->values.clear();
 
       // 执行平面分割
       seg.setInputCloud(cloudWork);
@@ -413,13 +596,12 @@ private:
       }
 
       // 提取平面内点
-      pcl::ExtractIndices<pcl::PointXYZ> extract;
       extract.setInputCloud(cloudWork);
       extract.setIndices(inliers);
 
       // 保存当前平面点云
-      pcl::PointCloud<pcl::PointXYZ>::Ptr plane(new pcl::PointCloud<pcl::PointXYZ>);
       extract.setNegative(false);
+      plane->clear();
       extract.filter(*plane);
 
       // 法向量归一化，过滤重复平面
@@ -440,20 +622,25 @@ private:
       // 保存有效平面
       if (!duplicate)
       {
-        planeCoeffs->push_back(coeff);
-        planeClouds->push_back(plane);
+        // 深拷贝系数
+        pcl::ModelCoefficients::Ptr coeff_copy(new pcl::ModelCoefficients(*coeff));
+        planeCoeffs->push_back(coeff_copy);
+
+        // 深拷贝平面点云
+        pcl::PointCloud<pcl::PointXYZ>::Ptr plane_copy(new pcl::PointCloud<pcl::PointXYZ>(*plane));
+        planeClouds->push_back(plane_copy);
       }
 
       // 移除已提取平面，保留剩余点云
       extract.setNegative(true);
-      pcl::PointCloud<pcl::PointXYZ>::Ptr remain(new pcl::PointCloud<pcl::PointXYZ>);
+      remain->clear();
       extract.filter(*remain);
       cloudWork.swap(remain);
     }
   }
 
   // 计算平面长轴方向
-  inline Eigen::Vector3f computeLongAxis(
+  Eigen::Vector3f computeLongAxis(
       const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
       const Eigen::Vector3f& zAxis) const
   {
@@ -499,25 +686,19 @@ private:
     return (cv::norm(e1) > cv::norm(e2)) ? dir1 : dir2;
   }
 
-  // 平面融合解算目标位姿
-  inline void solvePoseFromPlanes(
-      const std::vector<pcl::ModelCoefficients::Ptr>& coeffs,
-      const std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& clouds,
-      Eigen::Vector3f* center,
-      Eigen::Quaternionf* orientation)
+  // 多平面筛选， 修改并填充coeffs, clouds, planes
+  bool plane_filter(
+      std::vector<pcl::ModelCoefficients::Ptr>& coeffs,
+      std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& clouds,
+      std::vector<planeData>& planes
+  )
   {
-    // 平面数据结构体
-    struct planeData
-    {
-      Eigen::Vector3f normal;
-      Eigen::Vector3f bodyCenter;
-      int pointsCount;
-      size_t cloudIdx;
-      float faceArea;
-    };
+    planes.clear();
+    std::vector<pcl::ModelCoefficients::Ptr> new_coeffs;
+    std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> new_clouds;
 
     // 遍历平面，计算平面参数
-    std::vector<planeData> planes;
+    std::vector<int> valid_indices;         // 记录【合格平面的原始索引】
     for (size_t i = 0; i < coeffs.size(); ++i)
     {
       if (!clouds[i] || clouds[i]->empty())
@@ -568,19 +749,44 @@ private:
       const Eigen::Vector3f faceCenter = origin + rect.center.x * u + rect.center.y * v;
       const Eigen::Vector3f bodyCenter = faceCenter - n * static_cast<float>(cfg_.objectSize * 0.5);
       const float faceArea = rect.size.width * rect.size.height;
-
-      // 保存平面数据
-      planes.push_back({n, bodyCenter, static_cast<int>(clouds[i]->size()), i, faceArea});
+      // std::cout << "faceArea: " << faceArea << std::endl;
+      std::cout << "width: " << rect.size.width << ",height: " << rect.size.height << std::endl;
+ 
+       // 保存平面数据
+      if (std::abs(rect.size.width - cfg_.objectSize) < cfg_.size_min_bias
+          && std::abs(rect.size.height - cfg_.objectSize) < cfg_.size_min_bias)
+      {
+        planes.push_back({n, bodyCenter, static_cast<int>(clouds[i]->size()), planes.size(), faceArea});
+        valid_indices.push_back(i);  // 把合格的索引存下来
+        // std::cout << "planes: push_back" << std::endl;
+      }
     }
+
+    for (int idx : valid_indices)
+    {
+      new_coeffs.push_back(coeffs[idx]);
+      new_clouds.push_back(clouds[idx]);
+    }
+    // 用合格平面替换原始容器 → 不合格的彻底删除
+    coeffs.swap(new_coeffs);
+    clouds.swap(new_clouds);
 
     // 判断平面数据是否为空
     if (planes.empty())
     {
-      *center = Eigen::Vector3f::Zero();
-      *orientation = Eigen::Quaternionf::Identity();
-      return;
+      return false;
     }
+    else{return true;}
+  }
 
+  // 平面融合解算目标位姿
+  void solvePoseFromPlanes(
+      const std::vector<pcl::ModelCoefficients::Ptr>& coeffs,
+      const std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr>& clouds,
+      std::vector<planeData> planes,
+      Eigen::Vector3f* center,
+      Eigen::Quaternionf* orientation)
+  {
     // 首帧质量门控与平面匹配
     if (!poseInitialized_)
     {
@@ -745,7 +951,7 @@ private:
   }
 
   // ICP精配准优化位姿
-  inline Eigen::Affine3f refineWithICP(
+  Eigen::Affine3f refineWithICP(
       const pcl::PointCloud<pcl::PointXYZ>::Ptr& currentCloud,
       const Eigen::Vector3f& initCenter,
       const Eigen::Quaternionf& initOrientation)
@@ -820,7 +1026,7 @@ private:
   }
 
   // 滑动窗口位姿平滑
-  inline void smoothPose(Eigen::Vector3f* center, Eigen::Quaternionf* orientation)
+  void smoothPose(Eigen::Vector3f* center, Eigen::Quaternionf* orientation)
   {
     // 获取平滑窗口大小
     const int window = std::max(1, cfg_.smoothWindow);
@@ -867,8 +1073,17 @@ private:
 
 private:
   kfsPnpConfig cfg_;                                          // 算法配置参数
+  rs2_intrinsics color_intr_;
   std::vector<Eigen::Vector3f> centerWindow_;                // 位姿平滑窗口
   std::vector<Eigen::Quaternionf> orientationWindow_;         // 旋转平滑窗口
+
+  pcl::ExtractIndices<pcl::PointXYZ> extract;               // 索引提取器
+  pcl::PointIndices::Ptr inliers;                           // 平面内点索引
+  pcl::ModelCoefficients::Ptr coeff;                        // 平面系数
+  pcl::PointCloud<pcl::PointXYZ>::Ptr plane;                // 临时平面点云
+  pcl::PointCloud<pcl::PointXYZ>::Ptr remain;               // 剩余点云
+
+  std::vector<planeData> plane_info;
 
   bool poseInitialized_ = false;                              // 首帧初始化标志
   Eigen::Vector3f refZAxis_ = Eigen::Vector3f::Zero();       // 参考Z轴
@@ -876,6 +1091,8 @@ private:
   std::vector<Eigen::Vector3f> prevPlaneNormals_;            // 上一帧平面法向量
   pcl::PointCloud<pcl::PointXYZ>::Ptr prevCloud_;            // 上一帧点云
   Eigen::Affine3f prevPose_ = Eigen::Affine3f::Identity();   // 上一帧位姿
+
+  Ten::Ten_yolo detector;
 };
 
 } // namespace KFS

@@ -50,9 +50,10 @@ rosrun camera test_thread_node
 - 含 `test_node` 和 `test_pnp_node` 两个节点
 
 ### camera_ws4 — OpenVINO 集成版
-- 引入 OpenVINO 推理优化
-- 优化 PnP 解算性能
-- 保留 `test_node` + `test_pnp_node`
+- **新增** `openvino.cpp/h`: OpenVINO 推理优化模块
+- **新增** `yolo/` YOLO 目标检测集成
+- 优化 PnP 位姿解算精度
+- 更新 PnP 调试与参数配置
 
 ### camera_ws — YOLO 初始版
 - 引入 YOLO 目标检测（`yolo_base.cpp`）
