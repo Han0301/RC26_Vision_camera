@@ -69,9 +69,13 @@ rosrun camera test_thread_node
 - 融合 YOLO 检测与 OpenVINO 推理优化
 - 优化 Plane_FitLocator 点云处理管线
 
-### camera_ws2.22 — 基础稳定版
-- 精简稳定的相机驱动版本
-- 移除不必要的依赖
+### camera_ws2.22 — KFS 定位基础版
+- **新增** `kfs_locator/`: KFS 方块定位模块
+- **新增** `config/`: 配置文件目录
+- **移除** `openvino.cpp/h`: 移除 OpenVINO 推理
+- **移除** `Plane_FitLocator/`: 移除平面拟合定位
+- **移除** `image/`: 移除图像资源
+- 精简依赖，专注 KFS 定位功能
 
 ### camera_ws2.3 — 多线程处理版
 - 引入线程池（`threadpool.cpp`）

@@ -1,12 +1,12 @@
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <string>
-#include <stdexcept>
 #include <ros/ros.h>
 #include "camera.h"
-#include "./Plane_FitLocator/plane_fit.h"
+
 #include <rosbag/bag.h>
 #include <rosbag/view.h>
+#include "./kfs_locator/set_result.h"
 
 rosbag::Bag g_bag;
 rosbag::View* g_view = nullptr;
@@ -86,7 +86,7 @@ rs2_intrinsics createManualIntrinsics()
     return intr;
 }
 
-void set_key(Ten::Plane_FitLocator::Ten_debug_pcl& debug_pcl, bool &save_enabled)
+void set_key(Ten::kfs_locator::Ten_debug_pcl& debug_pcl, bool &save_enabled)
 {
     char key = cv::waitKey(1);
     if (key == 's' || key == 'S') // 按 S 启动保存
@@ -126,30 +126,33 @@ void test1_frombag()
 
     // 参数
     rs2_intrinsics color_intr = createManualIntrinsics();    // 彩色内参 → 绘图用
-    Ten::Plane_FitLocator::plane_fit plane_fiter(color_intr);
+    Ten::kfs_locator::Ten_set_result plane_fiter(color_intr);
 
     ros::Rate loop_rate(30);
     while (ros::ok())
     {
-        // 设置输入图像
+        // // 设置输入图像
         Ten::camera_frame frame = get_next_frame_from_bag();
-        bool is_ok = plane_fiter.process(frame);
-        if (is_ok)
-        {
-            // 以D435相机光轴(Z轴)为基准平面，平面内X轴为基准直线
-            const Eigen::Vector3d target_plane(0.0, 0.0, 1.0);
-            const Eigen::Vector3d line_point(0.0, 0.0, 0.0);
-            const Eigen::Vector3d line_dir(1.0, 0.0, 0.0);
 
-            // 计算偏差指标
-            Ten::Plane_FitLocator::result res = plane_fiter.set_result(
-                target_plane, line_point, line_dir);
-            double angle = res.deviation_angle;
-            std::cout << "angle: " <<  (angle * 180.0 / M_PI) << std::endl;
-            std::cout << "res.bias: " <<  res.bias << std::endl;
-            std::cout << "res.distance: " <<  res.distance << std::endl;
-            plane_fiter.publish(frame);
+        bool is_pre_ok = plane_fiter.preprocess(frame);
+        std::cout << "state: " <<  plane_fiter.get_state() << std::endl;
+        plane_fiter.publish(frame);
+
+        if (is_pre_ok)
+        {
+            bool is_post_ok = plane_fiter.postprocess();
+            if (is_post_ok)
+            {
+                // 计算偏差指标
+                Ten::kfs_locator::result res = plane_fiter.set_result();
+                double angle = res.bia_radian;
+                std::cout << "angle: " <<  (angle * 180.0 / M_PI) << std::endl;
+                std::cout << "res.x: " <<  res.x << std::endl;
+                std::cout << "res.y: " <<  res.y << std::endl;
+                std::cout << "res.z: " <<  res.z << std::endl;
+            }
         }
+
         ros::spinOnce();
         loop_rate.sleep();
     }
@@ -162,24 +165,42 @@ void test1_fromframe()
 
     // 参数
     rs2_intrinsics color_intr = _CAMERA_.get_color_intrinsics();    // 彩色内参 → 绘图用
-    Ten::Plane_FitLocator::plane_fit plane_fiter(color_intr);
+    Ten::kfs_locator::Ten_set_result plane_fiter(color_intr);
 
     while (ros::ok())
     {
         // 设置输入图像
         Ten::camera_frame frame = _CAMERA_.camera_read_depth();
-        bool is_ok = plane_fiter.process(frame);
-        Ten::Plane_FitLocator::Plane_Info plane = plane_fiter.get_plane_info();
-        if (is_ok)
+        // 处理流程
+        bool is_pre_ok = plane_fiter.preprocess(frame);
+        std::cout << "state: " <<  plane_fiter.get_state() << std::endl;
+        if (is_pre_ok)
         {
-            plane_fiter.publish(frame);
+            // 设置输入点云列表
+            std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> input_clouds = plane_fiter.get_input_clouds();
+            std::cout << "input_clouds size: " << input_clouds.size() << std::endl;
+            // 将输出点云直接给postprocess函数
+            bool is_post_ok = plane_fiter.postprocess();        // 置空输入点云，使用点云列表中的第一个点云
+            std::cout << "state: " <<  plane_fiter.get_state() << std::endl;
+            if (is_post_ok)
+            {
+                Ten::kfs_locator::result res = plane_fiter.set_result();
+                double angle = res.bia_radian;
+                std::cout << "angle: " <<  (angle * 180.0 / M_PI) << std::endl;
+                std::cout << "res.x: " <<  res.x << std::endl;
+                std::cout << "res.y: " <<  res.y << std::endl;
+                std::cout << "res.z: " <<  res.z << std::endl;
+            }
         }
+        // 调试发布
+        plane_fiter.publish(frame);
+        ros::spinOnce();
     }
 }
 
 void set_bias(
-    Ten::Plane_FitLocator::plane_fit& plane_fiter, 
-    Ten::Plane_FitLocator::Ten_debug_pcl& debug_pcl,
+    Ten::kfs_locator::Ten_set_result& plane_fiter, 
+    Ten::kfs_locator::Ten_debug_pcl& debug_pcl,
     std::string& save_path, 
     bool& save_enabled)
 {
@@ -201,8 +222,8 @@ void test2()
 
     // 参数
     rs2_intrinsics color_intr = _CAMERA_.get_color_intrinsics();    // 彩色内参 → 绘图用
-    Ten::Plane_FitLocator::plane_fit plane_fiter(color_intr);
-    Ten::Plane_FitLocator::Ten_debug_pcl debug_pcl;
+    Ten::kfs_locator::Ten_set_result plane_fiter(color_intr);
+    Ten::kfs_locator::Ten_debug_pcl debug_pcl;
     bool save_enabled = false; 
     std::string save_path = "/home/h/RC2026/camera_ws2/debug/0.8mchange.txt";
     cv::Mat debug_image;
@@ -212,9 +233,7 @@ void test2()
     {
         // 设置输入图像
         Ten::camera_frame frame = _CAMERA_.camera_read_depth();
-        plane_fiter.process(frame);
-        debug_pcl.set_debug_plane_quadrilateral(frame.bgr_image, plane_fiter.get_plane_info(), color_intr,debug_image);
-        cv::imshow("debug_view", debug_image);
+        plane_fiter.preprocess(frame);
         set_bias(plane_fiter,debug_pcl,save_path,save_enabled);
 
         ros::spinOnce();
@@ -229,7 +248,8 @@ int main(int argc, char** argv)
     // 初始化ROS节点--------------------------------------------------------------
     ros::init(argc, argv, "test_node");
     
-    test1_frombag();
+    test1_fromframe();
+    
     delete g_view;
     g_bag.close();
     return 0;
