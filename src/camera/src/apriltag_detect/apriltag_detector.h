@@ -11,10 +11,6 @@
 
 namespace Ten::apriltag_detect
 {
-
-const std::string MODEL_PATH = "/home/h/下载/卷轴检测blue/best";
-const std::string XPU        = "cpu";
-
 // 单个检测结果 (用于生成 YOLOv5 格式 JSON)
 struct TagDetection
 {
@@ -52,16 +48,11 @@ private:
     apriltag_detector_t*  td_      = nullptr;
     image_u8_t*           im_gray_ = nullptr;
     std::vector<TagDetection> detections_;  // 上次检测结果
-    Ten::yolo::yolo_v5    yolo_detector_;
-
-    // yolo 兜底检测
-    bool yoloFallback(cv::Mat& image);
 };
 
 // 构造实现
 inline AprilTagDetector::AprilTagDetector(int nthreads)
     : state_("init")
-    , yolo_detector_(MODEL_PATH, XPU, 0.8f, 0.8f, 0.8f)
 {
     tf_ = tagStandard41h12_create();
     if (!tf_)
@@ -203,14 +194,7 @@ inline bool AprilTagDetector::detect(cv::Mat& image)
     {
         return true;
     }
-    return yoloFallback(image);
-}
-
-// yolo兜底实现
-inline bool AprilTagDetector::yoloFallback(cv::Mat& image)
-{
-    std::vector<Ten::yolo::Detection> results = yolo_detector_.worker(image);
-    return !results.empty();
+    return false;
 }
 }  // namespace Ten::apriltag_detect
 #endif  // __APRILTAG_DETECTOR_H_

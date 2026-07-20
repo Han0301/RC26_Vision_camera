@@ -16,11 +16,13 @@ namespace Ten
     Ten_camera& Ten_camera::GetInstance(size_t w, size_t h, size_t fps)
     {
         static std::unique_ptr<Ten_camera> ten_camera = nullptr;
-        std::call_once(camera_flag_, [w, h, fps]() 
+        static std::once_flag flag;
+        std::call_once(flag, [&]()
         {
             ten_camera = create(w, h, fps);
-            std::cout << "init_camera" << std::endl;
         });
+        if (!ten_camera)
+            throw std::runtime_error("Ten_camera initialization failed");
         return *ten_camera;
     } 
 
@@ -31,7 +33,9 @@ namespace Ten
         rs2::frame color_frame = frames.get_color_frame();
         cv::Mat color_image(cv::Size(_w, _h), CV_8UC3, 
                            (void*)color_frame.get_data(), cv::Mat::AUTO_STEP);
-        return color_image.clone();  // 深拷贝, 避免 color_frame 析构后悬空
+        cv::Mat result = color_image.clone();  // 深拷贝, 避免 color_frame 析构后悬空
+        ensureBGR(result);                     // 如果是 RGB8，转成 BGR8
+        return result;
     }
 
     camera_frame Ten_camera::camera_read_depth()
@@ -49,6 +53,8 @@ namespace Ten
         // 转换为OpenCV矩阵格式
         frame.bgr_image = cv::Mat (cv::Size(_w, _h), CV_8UC3, 
                            (void*)color_frame.get_data(), cv::Mat::AUTO_STEP);
+        frame.bgr_image = frame.bgr_image.clone();  // 深拷贝
+        ensureBGR(frame.bgr_image);                  // 如果是 RGB8，转成 BGR8
 
         // 获取深度帧
         rs2::depth_frame depth_frame = aligned_frames.get_depth_frame();

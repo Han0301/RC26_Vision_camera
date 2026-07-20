@@ -240,6 +240,10 @@ target_link_libraries(test_node
 # )
 
 ## Mark other files for installation (e.g. launch and bag files, etc.)
+install(DIRECTORY launch/
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}/launch
+)
+
 # install(FILES
 #   # myfile1
 #   # myfile2

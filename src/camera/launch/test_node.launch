@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+    <!--
+        test_node 启动文件
+        用法: roslaunch camera test_node.launch
+    -->
+
+    <!-- 可选的输出路径参数 -->
+    <arg name="output_dir" default="/home/h/output" />
+
+    <!-- 运行 test_node -->
+    <node name="test_node" pkg="camera" type="test_node" output="screen">
+        <!-- 可通过私有参数传入，当前 test_node 尚未实现参数读取 -->
+    </node>
+</launch>

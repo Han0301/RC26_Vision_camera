@@ -5,6 +5,9 @@
 #include <ros/ros.h>
 #include <iomanip>
 #include <sstream>
+#include <image_transport/image_transport.h>
+#include <cv_bridge/cv_bridge.h>
+#include <sensor_msgs/image_encodings.h>
 #include "apriltag_detector.h"
 
 namespace Ten::apriltag_detect
@@ -13,9 +16,15 @@ namespace Ten::apriltag_detect
 class AprilTagDebug
 {
 public:
-    explicit AprilTagDebug(AprilTagDetector& detector)
+    explicit AprilTagDebug(AprilTagDetector& detector,
+                           ros::NodeHandle& nh,
+                           const std::string& topic = "/camera/apriltag_debug")
         : td_(detector.detector())
-    {}
+        , it_(nh)
+        , pub_(it_.advertise(topic, 1))
+    {
+        ROS_INFO("[AprilTagDebug] Publishing debug image on %s", topic.c_str());
+    }
 
     void drawOverlay(cv::Mat& image, int tag_count, double fps,
                      bool show_stats = false)
@@ -78,8 +87,86 @@ public:
             td_->quad_decimate, td_->decode_sharpening, td_->nthreads);
     }
 
+    /**
+     * @brief 绘制检测结果并发布调试图像
+     * @param image       原始 BGR 图像（会被绘制）
+     * @param detections  检测结果列表
+     * @param fps         当前帧率（可选，显示在左上角）
+     */
+    void publishDebugImage(cv::Mat& image,
+                           const std::vector<TagDetection>& detections,
+                           double fps = 0.0)
+    {
+        // 绘制检测框
+        drawDetections(image, detections);
+
+        // 绘制覆盖信息
+        drawDebugOverlay(image, (int)detections.size(), fps);
+
+        // 发布为 ROS 图像话题
+        sensor_msgs::ImagePtr msg = cv_bridge::CvImage(
+            std_msgs::Header(), "bgr8", image).toImageMsg();
+        msg->header.stamp = ros::Time::now();
+        pub_.publish(msg);
+    }
+
 private:
+    // 在图像上绘制检测框
+    static void drawDetections(cv::Mat& img,
+                               const std::vector<TagDetection>& detections)
+    {
+        for (const auto& t : detections)
+        {
+            // 外接矩形
+            cv::rectangle(img,
+                          cv::Point((int)t.bbox[0], (int)t.bbox[1]),
+                          cv::Point((int)t.bbox[2], (int)t.bbox[3]),
+                          cv::Scalar(0, 255, 0), 2);
+
+            // 4个角点
+            for (int j = 0; j < 4; ++j)
+                cv::circle(img,
+                           cv::Point((int)t.corners[j][0], (int)t.corners[j][1]),
+                           3, cv::Scalar(0, 0, 255), -1);
+
+            // 中心点
+            cv::circle(img,
+                       cv::Point((int)t.center[0], (int)t.center[1]),
+                       4, cv::Scalar(255, 0, 0), -1);
+
+            // 标签 ID
+            cv::putText(img,
+                        "ID:" + std::to_string(t.id),
+                        cv::Point((int)t.bbox[0], (int)t.bbox[1] - 5),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6,
+                        cv::Scalar(0, 255, 0), 2);
+        }
+    }
+
+    // 绘制调试覆盖信息（FPS、标签数等）
+    void drawDebugOverlay(cv::Mat& image, int tag_count, double fps) const
+    {
+        int y = 30;
+        if (fps > 0)
+        {
+            cv::putText(image,
+                        cv::format("FPS: %.1f", fps),
+                        cv::Point(10, y),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.8,
+                        cv::Scalar(0, 255, 255), 2);
+            y += 30;
+        }
+
+        cv::putText(image,
+                    "Tags: " + std::to_string(tag_count),
+                    cv::Point(10, y),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.8,
+                    cv::Scalar(0, 255, 255), 2);
+    }
+
     apriltag_detector_t* td_;
+    image_transport::ImageTransport it_;
+    image_transport::Publisher pub_;
 };
 
 }  // namespace Ten::apriltag_detect
