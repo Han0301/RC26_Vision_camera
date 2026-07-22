@@ -204,6 +204,25 @@ target_link_libraries(test_node
   apriltag::apriltag
 )
 
+# ===== kfs_locator 测试节点 =====
+add_executable(kfs_locator_test_node
+src/kfs_locator_test.cpp
+)
+
+target_sources(kfs_locator_test_node
+  PRIVATE
+  src/camera.cpp
+  src/method_math.cpp
+  src/yolo/yolo_base.cpp
+)
+
+target_link_libraries(kfs_locator_test_node
+  ${catkin_LIBRARIES}
+  openvino::runtime
+  ${realsense2_INCLUDE_DIR}
+  /usr/lib/x86_64-linux-gnu/librealsense2.so
+)
+
 #############
 ## Install ##
 #############

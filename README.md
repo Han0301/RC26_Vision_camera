@@ -36,6 +36,7 @@ source devel/setup.bash
 | `rosrun camera test_node` | 所有版本 | 主节点，功能因版本而异 |
 | `rosrun camera test_pnp_node` | ws3, ws4 | PnP 位姿解算 |
 | `rosrun camera test_thread_node` | ws2.3, ws2.4 | 多线程处理 / 线程池学习 |
+| `rosrun camera kfs_locator_test_node` | ws2.6 | KFS 方块定位（实时 / bag 回放 / 批量偏差） |
 
 ## 版本迭代日志
 
@@ -101,6 +102,15 @@ source devel/setup.bash
 - **移除** `kfs_locator/`, `test_thread.cpp`, `threadpool.cpp/h`, `learn/`
 - 全管线重构，专注 Apriltag 识别 R1 机器人
 
+### camera_ws2.6 — KFS 方块定位回归版
+- **`kfs_locator_test_node`**: 从 camera_ws2.4 回归 KFS 方块定位模块
+  - `kfs_locator/`: 完整子模块（set_detect / set_plane / set_result / set_filter / debug_pcl）
+  - `test1_fromframe()`: 相机实时帧 → 平面拟合 → 位姿输出
+  - `test1_frombag()`: rosbag 回放 → KFS 定位 → 偏差统计
+  - `test2_frombag()`: 多 bag 批量偏差分析 → 汇总统计文件
+- **新增** `launch/kfs_locator_test.launch`: 对应的 roslaunch 启动文件
+- Apriltag 测试节点 `test_node` 保持不变，两者共存
+
 ## 稳定版本
 
 | 版本 | 标签 | Release |
@@ -113,3 +123,4 @@ source devel/setup.bash
 | camera_ws2.3 | `camera/v2.3` | [v2.3](https://github.com/Han0301/RC26_Vision_camera/releases/tag/camera/v2.3) |
 | camera_ws2.4 | `camera/v2.4` | [v2.4](https://github.com/Han0301/RC26_Vision_camera/releases/tag/camera/v2.4) |
 | camera_ws2.51 | `camera/v2.51` | [v2.51](https://github.com/Han0301/RC26_Vision_camera/releases/tag/camera/v2.51) |
+| camera_ws2.6 | `camera/v2.6` | [v2.6](https://github.com/Han0301/RC26_Vision_camera/releases/tag/camera/v2.6) |

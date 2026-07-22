@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<launch>
+    <!--
+        kfs_locator 测试节点启动文件
+        用法: roslaunch camera kfs_locator_test.launch
+    -->
+
+    <!-- 可选的输出路径参数 -->
+    <arg name="output_dir" default="/home/h/output" />
+
+    <!-- 运行 kfs_locator_test_node -->
+    <node name="kfs_locator_test_node" pkg="camera" type="kfs_locator_test_node" output="screen">
+        <!-- 可通过私有参数传入，当前 kfs_locator_test_node 尚未实现参数读取 -->
+    </node>
+</launch>
