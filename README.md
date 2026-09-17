@@ -1,4 +1,4 @@
-# RC26 Vision Camera — Camera Workspace
+# RC26 Vision Camera
 
 > 基于 ROS Noetic + RealSense D435，用于深度点云平面拟合、PnP 位姿解算、KFS 方块定位与 Apriltag 识别。
 
