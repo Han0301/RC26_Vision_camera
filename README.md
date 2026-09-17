@@ -1,10 +1,6 @@
 # RC26 Vision Camera — Camera Workspace
 
-> 相机视觉感知工作区，基于 ROS Noetic + RealSense，用于点云平面拟合、PnP 位姿解算、KFS 方块定位与 Apriltag 识别。
-
-## 项目概述
-
-本项目是 RC26 机器人竞赛的**相机视觉感知**工作区，经过多个版本迭代，涵盖 RealSense 相机驱动、点云平面拟合 (Plane_FitLocator)、PnP 位姿解算 (KFS)、多线程流水线、KFS 方块识别与 Apriltag 标签检测。
+> 基于 ROS Noetic + RealSense D435，用于深度点云平面拟合、PnP 位姿解算、KFS 方块定位与 Apriltag 识别。
 
 ### 核心功能包
 
