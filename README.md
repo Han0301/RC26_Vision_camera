@@ -2,6 +2,16 @@
 
 > 基于 ROS Noetic + RealSense D435，用于深度点云平面拟合、PnP 位姿解算、KFS 方块定位与 Apriltag 识别。
 
+## 项目展示
+
+### KFS 方块位姿识别与点云可视化
+
+![KFS 方块位姿识别与点云可视化](docs/images/kfs-pnp-rviz.jpg)
+
+### KFS 方块 PnP 实时定位
+
+![KFS 方块 PnP 实时定位](docs/images/kfs-pnp-demo.jpg)
+
 ### 核心功能包
 
 | 包名 | 功能 |
@@ -120,3 +130,4 @@ source devel/setup.bash
 | camera_ws2.4 | `camera/v2.4` | [v2.4](https://github.com/Han0301/RC26_Vision_camera/releases/tag/camera/v2.4) |
 | camera_ws2.51 | `camera/v2.51` | [v2.51](https://github.com/Han0301/RC26_Vision_camera/releases/tag/camera/v2.51) |
 | camera_ws2.6 | `camera/v2.6` | [v2.6](https://github.com/Han0301/RC26_Vision_camera/releases/tag/camera/v2.6) |
+
